@@ -245,8 +245,8 @@ def check_and_install_dependencies():
 
     # First check if pip is available
     try:
-        import pip
-    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (ImportError, subprocess.CalledProcessError):
         print("pip is not installed. Installing pip...")
         try:
             # Try using the system package manager first
@@ -534,8 +534,6 @@ def get_local_repo_path():
 
 def manage_git_config(repo_path, git_config_path):
     """Check and manage the .git/config file."""
-    config = configparser.ConfigParser()
-
     # If .git/config does not exist, create it
     if not os.path.exists(git_config_path):
         print(f".git/config file not found in {repo_path}. Creating one...")
@@ -543,34 +541,36 @@ def manage_git_config(repo_path, git_config_path):
         with open(git_config_path, "w") as f:
             f.write("[remote \"origin\"]\n")
             f.write("    url = \n")
-
-    # Load the config file
-    config.read(git_config_path)
-
-    # Check for "url" in the remote "origin" section
-    if "remote \"origin\"" not in config or "url" not in config["remote \"origin\""]:
-        config["remote \"origin\""] = {"url": ""}
-
-    # Parse and validate the existing URL
-    url = config["remote \"origin\""]["url"]
+    
+    # Instead of using configparser which can't handle duplicate keys,
+    # directly read the git config using git command
+    url = ""
+    try:
+        url = run_command(["git", "config", "--get", "remote.origin.url"])
+    except Exception:
+        url = ""
+    
     existing_username = ""
     github_token = ""
     repo_name = ""
     
-    if "@" in url:
-        credentials_start = url.find("https://") + len("https://")
-        credentials_end = url.find("@")
-        credentials = url[credentials_start:credentials_end]
-        existing_username, github_token = credentials.split(":")
-        
-        # Extract the repository path correctly
-        repo_url_part = url[credentials_end + 1:]
-        if "github.com/" in repo_url_part:
-            github_repo_part = repo_url_part.split("github.com/", 1)[1]
-            if github_repo_part.endswith(".git"):
-                repo_name = github_repo_part[:-4]  # Remove .git extension
-            else:
-                repo_name = github_repo_part
+    if url:
+        if "@" in url:
+            credentials_start = url.find("https://") + len("https://")
+            credentials_end = url.find("@")
+            if credentials_start >= 0 and credentials_end >= 0:
+                credentials = url[credentials_start:credentials_end]
+                if ":" in credentials:
+                    existing_username, github_token = credentials.split(":", 1)
+                
+            # Extract the repository path correctly
+            repo_url_part = url[credentials_end + 1:]
+            if "github.com/" in repo_url_part:
+                github_repo_part = repo_url_part.split("github.com/", 1)[1]
+                if github_repo_part.endswith(".git"):
+                    repo_name = github_repo_part[:-4]  # Remove .git extension
+                else:
+                    repo_name = github_repo_part
 
     # Prompt for GitHub username
     username = input("Enter your GitHub username: ").strip()
@@ -585,11 +585,9 @@ def manage_git_config(repo_path, git_config_path):
             repo_project = input("Enter the name of your GitHub repository (e.g., 'ee-containers'): ").strip()
             repo_name = f"{repo_owner}/{repo_project}"
 
-        # Update the URL in the config file
+        # Update the URL using git command directly
         new_url = f"https://{username}:{github_token}@github.com/{repo_name}.git"
-        config["remote \"origin\""]["url"] = new_url
-        with open(git_config_path, "w") as configfile:
-            config.write(configfile)
+        run_command(["git", "config", "remote.origin.url", new_url])
         print(f"Updated .git/config with new URL: {new_url}")
 
     # Ensure github_token and repo_name are always returned
@@ -2289,21 +2287,33 @@ def create_repo_workflow():
                 new_repo_data = response.json()
                 print(f"{colors['GREEN']}✓ Repository created successfully: {new_repo_data['html_url']}{colors['RESET']}")
                 
-                # Now get the repo object using PyGithub
-                try:
-                    repo = g.get_repo(full_repo_name)
-                    # Set up local git repository and push to GitHub
-                    success = setup_local_git_repo(repo_path, repo, username, github_token)
-                    
-                    if success:
-                        # Ask if user wants to protect the default branch
-                        protect_branch_opt = input(f"Do you want to protect the {repo.default_branch} branch? (yes/no): ").strip().lower()
-                        if protect_branch_opt == "yes":
-                            print(f"\nSetting up protection for {repo.default_branch} branch...")
-                            protect_branch(repo, repo.default_branch)
-                except Exception as e:
-                    print(f"{colors['YELLOW']}Repository created, but local setup failed: {e}{colors['RESET']}")
-                    print(f"You can clone it manually with: git clone {new_repo_data['html_url']}")
+                # Wait a moment for the repository to be ready
+                print("Waiting for repository to become available...")
+                max_retries = 5
+                for retry in range(max_retries):
+                    try:
+                        time.sleep(2)  # Wait 2 seconds between retries
+                        repo = g.get_repo(full_repo_name)
+                        # Successfully got the repo, proceed
+                        break
+                    except github.GithubException as e:
+                        if retry < max_retries - 1:
+                            print(f"Retry {retry+1}/{max_retries}...")
+                        else:
+                            print(f"{colors['YELLOW']}Repository created, but it's not ready for access yet.{colors['RESET']}")
+                            print(f"You can manually clone it later with: git clone {new_repo_data['html_url']}")
+                            print(f"Or try running option 8 from the menu after a few seconds.")
+                            return
+                
+                # Set up local git repository and push to GitHub
+                success = setup_local_git_repo(repo_path, repo, username, github_token)
+                
+                if success:
+                    # Ask if user wants to protect the default branch
+                    protect_branch_opt = input(f"Do you want to protect the {repo.default_branch} branch? (yes/no): ").strip().lower()
+                    if protect_branch_opt == "yes":
+                        print(f"\nSetting up protection for {repo.default_branch} branch...")
+                        protect_branch(repo, repo.default_branch)
             else:
                 error_msg = response.json().get('message', f"HTTP Error: {response.status_code}")
                 print(f"{colors['RED']}Error creating repository: {error_msg}{colors['RESET']}")
@@ -2312,6 +2322,182 @@ def create_repo_workflow():
     
     except Exception as e:
         logger.error(f"Error in create_repo_workflow: {e}")
+        print(f"{colors['RED']}Error: {e}{colors['RESET']}")
+
+def delete_repo_workflow():
+    """Workflow for deleting a GitHub repository."""
+    print(f"\n{colors['BOLD']}--- Delete GitHub Repository ---{colors['RESET']}")
+    print(f"{colors['RED']}⚠️  WARNING: This will permanently delete a repository and all its contents!{colors['RESET']}")
+    print("This operation cannot be undone.")
+    print("\n")
+    
+    # Authenticate with GitHub
+    username = input("Enter your GitHub username: ").strip()
+    github_token = input("Enter your GitHub personal access token: ").strip()
+    
+    try:
+        # Create GitHub instance
+        g = Github(github_token)
+        user = g.get_user()
+        
+        # Verify authentication
+        try:
+            user_login = user.login
+            print(f"{colors['GREEN']}✓ Successfully authenticated as {user_login}{colors['RESET']}")
+            if username.lower() != user_login.lower():
+                print(f"{colors['YELLOW']}⚠️ Note: Authenticated username ({user_login}) differs from entered username ({username}){colors['RESET']}")
+                username = user_login
+        except github.GithubException:
+            print(f"{colors['RED']}Authentication failed. Please check your token.{colors['RESET']}")
+            return
+            
+        # Fetch all repositories the user has access to
+        print("\nFetching your repositories...")
+        
+        try:
+            from rich.console import Console
+            from rich.progress import Progress
+            console = Console()
+            enhanced_ui = True
+        except ImportError:
+            enhanced_ui = False
+        
+        # Get user's repositories
+        repos = []
+        
+        if enhanced_ui:
+            with Progress() as progress:
+                task = progress.add_task("[cyan]Fetching repositories...", total=None)
+                for repo in user.get_repos():
+                    if repo.permissions.admin:  # Only include repos where user has admin access
+                        repos.append(repo)
+                    progress.update(task, advance=1)
+        else:
+            print("Fetching repositories (this may take a moment)...")
+            for repo in user.get_repos():
+                if repo.permissions.admin:  # Only include repos where user has admin access
+                    repos.append(repo)
+        
+        if not repos:
+            print(f"{colors['YELLOW']}No repositories found that you have permission to delete.{colors['RESET']}")
+            return
+            
+        # Sort repositories by name
+        repos.sort(key=lambda r: r.name.lower())
+        
+        # Display list of repositories
+        print(f"\n{colors['BOLD']}Select a repository to delete:{colors['RESET']}")
+        
+        # Try to use enhanced UI if available
+        selected_repo = None
+        
+        if enhanced_ui:
+            try:
+                import questionary
+                repo_choices = [f"{repo.full_name} ({'Private' if repo.private else 'Public'})" for repo in repos]
+                selected = questionary.select(
+                    "Select repository to delete:",
+                    choices=repo_choices
+                ).ask()
+                if selected:
+                    selected_index = repo_choices.index(selected)
+                    selected_repo = repos[selected_index]
+            except Exception:
+                enhanced_ui = False
+                
+        # Fall back to simple UI if enhanced UI failed or isn't available
+        if not enhanced_ui:
+            for i, repo in enumerate(repos, 1):
+                visibility = f"{colors['RED']}Private{colors['RESET']}" if repo.private else f"{colors['GREEN']}Public{colors['RESET']}"
+                print(f"{i}. {repo.full_name} ({visibility})")
+                
+            choice = input("\nEnter repository number to delete (0 to cancel): ").strip()
+            if not choice or choice == "0":
+                print("Operation cancelled.")
+                return
+                
+            try:
+                choice_num = int(choice)
+                if 1 <= choice_num <= len(repos):
+                    selected_repo = repos[choice_num - 1]
+                else:
+                    print("Invalid selection. Operation cancelled.")
+                    return
+            except ValueError:
+                print("Invalid input. Operation cancelled.")
+                return
+            
+        if not selected_repo:
+            print("No repository selected. Operation cancelled.")
+            return
+            
+        # Now we have the selected repository
+        repo = selected_repo
+        full_repo_name = repo.full_name
+        repo_name = repo.name
+            
+        print(f"\n{colors['YELLOW']}Repository selected: {repo.html_url}{colors['RESET']}")
+        print(f"Description: {repo.description or 'No description'}")
+        print(f"Visibility: {'Private' if repo.private else 'Public'}")
+        print(f"Created: {repo.created_at.strftime('%Y-%m-%d')}")
+        print(f"Last updated: {repo.updated_at.strftime('%Y-%m-%d')}")
+        
+        # Multiple confirmation steps
+        print(f"\n{colors['RED']}⚠️  DANGER ZONE: You are about to permanently delete {full_repo_name}{colors['RESET']}")
+        
+        # First confirmation
+        confirmation_text = input(f"To confirm, please type the repository name ({repo_name}): ").strip()
+        if confirmation_text != repo_name:
+            print("Repository name doesn't match. Operation cancelled.")
+            return
+        
+        # Second confirmation with random code
+        import random
+        import string
+        confirmation_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        print(f"\nFinal verification step. Please type the following code: {colors['BOLD']}{confirmation_code}{colors['RESET']}")
+        user_code = input("Confirmation code: ").strip()
+        
+        if user_code != confirmation_code:
+            print("Confirmation code doesn't match. Operation cancelled.")
+            return
+        
+        # Perform deletion
+        print(f"\nDeleting repository {full_repo_name}...")
+        
+        def do_delete():
+            repo.delete()
+            return True
+        
+        result = show_spinner("Deleting repository", do_delete)
+        
+        if result:
+            print(f"\n{colors['GREEN']}✓ Repository {full_repo_name} has been permanently deleted.{colors['RESET']}")
+            
+            # Check if local copy exists
+            local_repo_path = os.path.join(os.getcwd(), repo_name)
+            if os.path.exists(local_repo_path) and os.path.isdir(local_repo_path):
+                print(f"\nA local directory with the same name exists at: {local_repo_path}")
+                delete_local = input("Do you want to delete the local repository too? (yes/no): ").strip().lower() == "yes"
+                
+                if delete_local:
+                    try:
+                        import shutil
+                        shutil.rmtree(local_repo_path)
+                        print(f"{colors['GREEN']}✓ Local repository deleted.{colors['RESET']}")
+                    except Exception as e:
+                        print(f"{colors['RED']}Error deleting local repository: {e}{colors['RESET']}")
+        else:
+            print(f"{colors['RED']}Failed to delete repository.{colors['RESET']}")
+            
+    except github.GithubException as e:
+        logger.error(f"GitHub API error deleting repository: {e}")
+        print(f"{colors['RED']}Error deleting repository: {e}{colors['RESET']}")
+        if e.status == 403:
+            print("You may not have permission to delete this repository.")
+            print("Make sure your token has the 'delete_repo' scope.")
+    except Exception as e:
+        logger.error(f"Error in delete_repo_workflow: {e}")
         print(f"{colors['RED']}Error: {e}{colors['RESET']}")
 
 def display_menu():
@@ -2328,9 +2514,10 @@ def display_menu():
     print("6. Remove Branch Protection")
     print("7. Review & Merge Pull Requests")
     print("8. Show User & Repository Info")
-    print("9. Exit")
+    print("9. Delete GitHub Repository")
+    print("10. Exit")
     print("-" * 50)
-    return input("Enter your choice (1-9): ").strip()
+    return input("Enter your choice (1-10): ").strip()
 
 def parse_cli_arguments():
     """Parse command-line arguments for quick commands"""
@@ -2448,7 +2635,7 @@ def main():
             
         # Main interactive menu loop
         while True:
-            choice = display_menu()
+            choice = enhanced_menu_display()
             
             if choice == '1':
                 branch_protection_workflow()
@@ -2551,125 +2738,18 @@ def show_repository_dashboard(repo):
         # Stats table
         stats_table = Table(title="Repository Statistics", box=box.ROUNDED)
         stats_table.add_column("Metric", style="cyan")
-        stats_table.add_column("Value", style="green", justify="right")
-        stats_table.add_row("Stars", str(repo.stargazers_count))
-        stats_table.add_row("Forks", str(repo.forks_count))
-        stats_table.add_row("Watchers", str(repo.subscribers_count))
-        stats_table.add_row("Open Issues", str(repo.open_issues_count))
-        stats_table.add_row("Default Branch", repo.default_branch)
-        stats_table.add_row("Created", repo.created_at.strftime("%Y-%m-%d"))
-        stats_table.add_row("Last Updated", repo.updated_at.strftime("%Y-%m-%d %H:%M"))
-        console.print(stats_table)
         
-        # Branch comparison
-        console.print("\n[bold]Branch Status[/bold]")
-        def get_branches_with_commits():
-            branches = []
-            for branch in repo.get_branches():
-                try:
-                    ahead_behind = repo.compare(f"{repo.default_branch}...{branch.name}")
-                    branches.append((
-                        branch.name, 
-                        ahead_by, 
-                        behind_by,
-                        branch.name in PROTECTED_BRANCHES
-                    ))
-                except Exception:
-                    branches.append((branch.name, "?", "?", branch.name in PROTECTED_BRANCHES))
-            return branches
-        branches = get_branches_with_commits()
-        
-        branch_table = Table(box=box.SIMPLE)
-        branch_table.add_column("Branch", style="cyan")
-        branch_table.add_column("Ahead", justify="right")
-        branch_table.add_column("Behind", justify="right")
-        branch_table.add_column("Protected", justify="center")
-        for branch, ahead, behind, protected in branches:
-            is_default = branch == repo.default_branch
-            branch_style = "bold" if is_default else ""
-            protected_status = "✓" if protected else ""
-            branch_table.add_row(
-                f"[{branch_style}]{branch}[/{branch_style}]" if branch_style else branch,
-                str(ahead),
-                str(behind),
-                protected_status
-            )
-        console.print(branch_table)
-        
-        # Recent activity
-        console.print("\n[bold]Recent Activity[/bold]")
-        activity_table = Table(box=box.SIMPLE)
-        activity_table.add_column("Event", style="cyan")
-        activity_table.add_column("User", style="green")
-        activity_table.add_column("Date", style="yellow")
+        # Try to fetch branches
         try:
-            events = list(repo.get_events())[:5]
-            for event in events:
-                activity_table.add_row(
-                    event.type,
-                    event.actor.login if event.actor else "Unknown",
-                    event.created_at.strftime("%Y-%m-%d %H:%M")
-                )
-            console.print(activity_table)
-        except Exception as e:
-            console.print(f"[yellow]Could not fetch recent events: {e}[/yellow]")
-        
-        # Pull Request summary
-        try:
-            open_prs = list(repo.get_pulls(state='open'))
-            if open_prs:
-                console.print(f"\n[bold]Open Pull Requests ({len(open_prs)})[/bold]")
-                for pr in open_prs[:3]:  # Show most recent 3
-                    console.print(f"#{pr.number}: {pr.title}")
-                if len(open_prs) > 3:
-                    console.print(f"... and {len(open_prs) - 3} more")
-        except Exception as e:
-            console.print(f"[yellow]Could not fetch pull requests: {e}[/yellow]")
-        
-        return True
-    except ImportError:
-        # Fallback to simple text display
-        print(f"\nRepository Dashboard: {repo.full_name}")
-        print("-" * 50)
-        print(f"Description: {repo.description or 'No description'}")
-        print(f"Visibility: {'Private' if repo.private else 'Public'}")
-        print(f"Stars: {repo.stargazers_count} | Forks: {repo.forks_count} | Watchers: {repo.subscribers_count}")
-        print(f"Open Issues: {repo.open_issues_count}")
-        print(f"Default Branch: {repo.default_branch}")
-        print(f"Created: {repo.created_at.strftime('%Y-%m-%d')}")
-        print(f"Last Updated: {repo.updated_at.strftime('%Y-%m-%d %H:%M')}")
-        print("-" * 50)
-        
-        # Show branches in simple format
-        print("\nBranch Structure:")
-        try:
-            branches = get_cached_branches(repo)
-            default_branch = repo.default_branch
-            
-            print(f"* {default_branch} (default)")
-            
-            for branch in branches:
-                if branch.name != default_branch:
-                    protected = f" {colors['YELLOW']}(protected){colors['RESET']}" if branch.name in PROTECTED_BRANCHES else ""
-                    print(f"  ├─ {branch.name}{protected}")
-                    
-                    # Try to check for PRs
-                    try:
-                        pulls = list(repo.get_pulls(head=f"{repo.owner.login}:{branch.name}", 
-                                               base=default_branch, 
-                                               state="open"))
-                        if pulls:
-                            pr = pulls[0]
-                            status = f"{colors['GREEN']}[Ready]{colors['RESET']}" if pr.mergeable else f"{colors['RED']}[Conflicts]{colors['RESET']}"
-                            print(f"     └─ PR #{pr.number}: {pr.title} {status}")
-                    except:
-                        pass
-            
-            return True
+            branches = list(repo.get_branches())
+            # Add code to display branch information
         except Exception as e:
             print(f"Could not fetch branches: {e}")
             
         return True
+    except Exception as e:
+        print(f"Could not display repository dashboard: {e}")
+        return False
 
 def setup_notification_system():
     """Set up desktop notifications for long-running tasks"""
