@@ -1,0 +1,123 @@
+import os
+import subprocess
+import json
+import getpass
+import requests
+import keyring
+
+# Utility function to run shell commands
+def run_command(command, cwd=None, check=True):
+    if isinstance(command, str):
+        command = command.split()
+    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+    if result.returncode != 0 and check:
+        print(f"Error running command: {' '.join(command)}\n{result.stderr}")
+        return None
+    return result.stdout.strip()
+
+# Prompt user for input
+def get_user_input(prompt_text, default=None, private=False):
+    if private:
+        user_input = getpass.getpass(f"{prompt_text} (default: {default}): ") if default else getpass.getpass(f"{prompt_text}: ")
+    else:
+        user_input = input(f"{prompt_text} (default: {default}): ") if default else input(f"{prompt_text}: ")
+    return user_input.strip() if user_input else default
+
+def main():
+    print("=== GitHub Repository Setup Script ===")
+
+    # Prompt for user inputs
+    github_account = get_user_input("Enter your GitHub account/username (e.g., github.com/<account>):")
+    github_user = get_user_input("Enter your GitHub username:")
+    github_token = get_user_input("Enter your GitHub personal access token (with repo permissions):", private=True)
+    repo_name = get_user_input("Enter the name of the repository to create:")
+    if not repo_name:
+        print("Repository name cannot be empty!")
+        exit(1)
+    repo_description = get_user_input("Enter the repository description (optional):", default="New repository created with Python")
+    local_repo_path = get_user_input("Enter the path to create or use an existing directory for the repository:")
+    if not os.path.exists(local_repo_path):
+        os.makedirs(local_repo_path)
+        print(f"Created directory: {local_repo_path}")
+    initialize_with_readme = get_user_input("Should the repository be initialized with a README file? (true/false):", default="false").lower() == "true"
+
+    # Save token securely
+    keyring.set_password("github_utils", github_user, github_token)
+
+    # Retrieve token
+    token = keyring.get_password("github_utils", github_user)
+
+    # Step 1: Initialize a local Git repository
+    print("\nInitializing local Git repository...")
+    run_command("git init", cwd=local_repo_path)
+
+    # Step 2: Create a .gitignore file
+    print("\nCreating .gitignore file...")
+    gitignore_content = """
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.vscode/
+"""
+    with open(os.path.join(local_repo_path, ".gitignore"), "w") as f:
+        f.write(gitignore_content)
+
+    # Step 3: Add and commit the .gitignore file
+    print("\nStaging and committing .gitignore...")
+    run_command("git add .gitignore", cwd=local_repo_path)
+    run_command("git commit -m 'Add .gitignore file'", cwd=local_repo_path, check=False)  # Allow if nothing to commit
+
+    # Step 4: Create a repository on GitHub
+    print("\nCreating GitHub repository...")
+    github_api_url = "https://api.github.com/user/repos"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    repo_data = {
+        "name": repo_name,
+        "description": repo_description,
+        "private": False,
+        "auto_init": initialize_with_readme,
+    }
+    response = requests.post(github_api_url, json=repo_data, headers=headers)
+    if not response.ok:
+        print(f"GitHub API error: {response.json().get('message', response.text)}")
+        exit(1)
+
+    github_response = response.json()
+
+    print(f"GitHub repository '{repo_name}' created successfully at {github_response['html_url']}")
+
+    # Step 5: Add remotes (HTTP and SSH)
+    print("\nAdding remotes to the local repository...")
+    run_command(f"git remote add origin https://github.com/{github_user}/{repo_name}.git", cwd=local_repo_path, check=False)
+    run_command(f"git remote set-url --add origin git@github.com:{github_user}/{repo_name}.git", cwd=local_repo_path, check=False)
+
+    # Step 6: Detect current branch and push
+    print("\nDetecting current branch and pushing to GitHub...")
+    current_branch = run_command("git branch --show-current", cwd=local_repo_path)
+    run_command(f"git push -u origin {current_branch}", cwd=local_repo_path, check=False)
+
+    # Step 7: Save variables to ~/.git/extravars for reuse
+    print("\nSaving configuration for future runs...")
+    extravars_path = os.path.expanduser("~/.git/extravars")
+    os.makedirs(os.path.dirname(extravars_path), exist_ok=True)
+    with open(extravars_path, "w") as f:
+        f.write(f"github_account: {github_account}\n")
+        f.write(f"github_user: {github_user}\n")
+        f.write(f"github_token: {github_token}\n")
+        f.write(f"repo_name: {repo_name}\n")
+        f.write(f"repo_description: {repo_description}\n")
+        f.write(f"local_repo_path: {local_repo_path}\n")
+        f.write(f"initialize_with_readme: {initialize_with_readme}\n")
+
+    print("\n=== Setup Complete ===")
+    print(f"Repository created at {github_response['html_url']}")
+    print(f"Local repository initialized at {local_repo_path}")
+
+
+if __name__ == "__main__":
+    main()

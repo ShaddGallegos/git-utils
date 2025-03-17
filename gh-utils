@@ -1,0 +1,2976 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import time
+import configparser
+import logging
+import argparse
+import platform
+import re
+import threading
+import itertools
+import shutil
+from pathlib import Path
+
+# Add ctypes import for Windows admin check
+try:
+    import ctypes
+except ImportError:
+    pass
+
+# --- COMMON UTILITY FUNCTIONS ---
+def clear_screen():
+    """Clear the terminal screen."""
+    if platform.system() == "Windows":
+        os.system('cls')
+    else:
+        os.system('clear')
+
+# --- TITLE SCREEN DISPLAY ---
+def display_title_screen():
+    """Display the ASCII art title screen, centered in terminal."""
+    try:
+        # Get terminal size
+        terminal_width, _ = shutil.get_terminal_size((80, 20))
+        
+        # Try to load the ASCII art file
+        ascii_art_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ascii-bw-shadowman.txt")
+        
+        if os.path.exists(ascii_art_path):
+            with open(ascii_art_path, 'r') as f:
+                ascii_art = f.readlines()
+                
+            # Clear screen
+            clear_screen()
+            
+            # Find maximum width of ASCII art to calculate proper centering
+            max_width = max(len(line.rstrip('\n')) for line in ascii_art if line.strip())
+            
+            # Display centered ASCII art
+            print("\n")  # Add some padding at top
+            for line in ascii_art:
+                # Remove trailing newline
+                line = line.rstrip('\n')
+                if line.strip():  # Only center non-empty lines
+                    padding = max(0, (terminal_width - len(line)) // 2)
+                    print(" " * padding + line)
+                else:
+                    print("")  # Print empty line without padding
+            
+            print("\n" + "GitHub Repository Management Tools".center(terminal_width) + "\n")
+            print("v{}".format(__version__).center(terminal_width))
+            
+            # Pause for 4 seconds
+            time.sleep(4)
+        else:
+            # If file doesn't exist, just continue silently
+            pass
+    except Exception as e:
+        # Don't interrupt program flow if display fails
+        logger.debug(f"Could not display title screen: {e}")
+
+# --- PRIVILEGE CHECK AND INSTALLATION INFO ---
+def check_elevated_privileges():
+    """Check if the user has elevated privileges (root/admin/sudo)."""
+    system = platform.system()
+    
+    if system == "Linux":
+        # Check if running as root
+        if os.geteuid() == 0:
+            return True
+        
+        # Check if user has sudo access
+        try:
+            subprocess.check_output(["sudo", "-n", "true"])
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+            
+    elif system == "Darwin":  # macOS
+        # Check if running as root
+        if os.geteuid() == 0:
+            return True
+            
+        # Check if user has sudo access
+        try:
+            subprocess.check_output(["sudo", "-n", "true"])
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+            
+    elif system == "Windows":
+        # Check if running as administrator
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except:
+            return False
+            
+    return False  # Unknown OS
+
+def show_installation_info():
+    """Show information about what will be installed and changed, and ask for confirmation."""
+    system = platform.system()
+    
+    # Clear screen before showing installation info
+    clear_screen()
+    
+    print("\n=== GitHub Repository Management Tools Installation ===\n")
+    print("`gh-utils` provides a streamlined interface for common GitHub repository management tasks, helping developers manage their repositories more efficiently without needing to navigate through the GitHub web interface for routine operations.")
+    print("\nThis script requires elevated privileges (root/admin/sudo) to install dependencies.")
+    
+    if not check_elevated_privileges():
+        print("\n⚠️  WARNING: You don't appear to have elevated privileges.")
+        print("This script may not function correctly without them.")
+        print("\nTo run with elevated privileges:")
+        if system == "Linux" or system == "Darwin":
+            print("    sudo python gh-utils")
+        elif system == "Windows":
+            print("    Right-click Command Prompt/PowerShell and select 'Run as administrator'")
+            print("    Then navigate to this directory and run the script")
+        
+        proceed_anyway = input("\nDo you want to proceed anyway? (yes/no): ").strip().lower()
+        if proceed_anyway not in ("yes", "y"):
+            print("Exiting.")
+            sys.exit(0)
+    
+    print("\nThis script will install the following packages:")
+    print("- colorama: For colored terminal output")
+    print("- keyring: For secure credential storage")
+    print("- PyGithub: For GitHub API interaction")
+    print("- rich: For enhanced terminal UI")
+    print("- questionary: For interactive prompts")
+    
+    if system == "Darwin":  # macOS
+        print("- pync: For macOS notifications")
+    elif system == "Linux":
+        print("- notify2: For Linux desktop notifications")
+    elif system == "Windows":
+        print("- win10toast: For Windows notifications")
+        
+    print("\nThe script will make the following changes to your system:")
+    print("1. Create a config directory at ~/.gh-utils/")
+    print("2. Create a log file at ~/.gh-utils/gh-utils.log")
+    print("3. Create a config file at ~/.gh-utils.ini")
+    print("4. Store GitHub credentials in your system's secure keyring")
+    
+    while True:
+        response = input("\nDo you want to continue? (yes/no): ").strip().lower()
+        if response in ("yes", "y"):
+            return True
+        elif response in ("no", "n"):
+            print("Installation cancelled. Exiting.")
+            sys.exit(0)
+        else:
+            print("Please enter 'yes' or 'no'.")
+
+# Run the privilege check and installation info at the very beginning
+if not os.environ.get('GH_UTILS_RESTARTED'):
+    if not show_installation_info():
+        sys.exit(0)
+
+# --- DEPENDENCY MANAGEMENT ---
+REQUIRED_PACKAGES = [
+    "colorama",
+    "keyring",
+    "PyGithub",
+    "rich",
+    "questionary"  # Common packages for all platforms
+]
+
+# Add platform-specific packages
+if platform.system() == "Darwin":  # macOS
+    REQUIRED_PACKAGES.append("pync")
+elif platform.system() == "Linux":
+    REQUIRED_PACKAGES.append("notify2")
+elif platform.system() == "Windows":
+    REQUIRED_PACKAGES.append("win10toast")
+
+__version__ = "1.0.0"
+PROTECTED_BRANCHES = ['main', 'master']
+DEFAULT_MERGE_METHOD = "merge"
+CONFIG_PATH = os.path.expanduser("~/.gh-utils")
+
+# Define colorama_available before it's used
+colorama_available = False
+
+# Now the init_colors function can safely use the variable
+def init_colors():
+    """Initialize colored output support."""
+    if colorama_available:
+        return {
+            "RED": Fore.RED,
+            "GREEN": Fore.GREEN,
+            "YELLOW": Fore.YELLOW,
+            "BLUE": Fore.BLUE,
+            "RESET": Style.RESET_ALL,
+            "BOLD": Style.BRIGHT
+        }
+    else:
+        return {
+            "RED": "",
+            "GREEN": "",
+            "YELLOW": "",
+            "BLUE": "",
+            "RESET": "",
+            "BOLD": ""
+        }
+
+colors = init_colors()  # Create initial basic colors
+
+def check_and_install_dependencies():
+    """Check if required packages are installed and install them if needed."""
+    # Check for a config file that tracks when we last checked dependencies
+    config_path = os.path.expanduser("~/.gh-utils.ini")
+    config = configparser.ConfigParser()
+    
+    if os.path.exists(config_path):
+        config.read(config_path)
+        if config.has_section("dependencies"):
+            last_check = config.getfloat("dependencies", "last_check", fallback=0)
+            packages_checked = config.get("dependencies", "packages_checked", fallback="")
+            
+            # If we checked within the last week and packages match, skip check
+            if (time.time() - last_check < 604800 and  # 7 days in seconds
+                packages_checked == ','.join(REQUIRED_PACKAGES)):
+                return True
+
+    # Check for restart marker
+    restart_flag = "__RESTARTING__"
+    if restart_flag in sys.argv:
+        # We're in a post-restart state, remove the flag
+        sys.argv.remove(restart_flag)
+        print("Script restarted. Continuing...")
+        return True
+
+    # First check if pip is available
+    try:
+        import pip
+    except ImportError:
+        print("pip is not installed. Installing pip...")
+        try:
+            # Try using the system package manager first
+            if os.path.exists('/usr/bin/dnf'):
+                subprocess.run(['sudo', 'dnf', 'install', '-y', 'python3-pip'], check=True)
+            elif os.path.exists('/usr/bin/apt-get'):
+                subprocess.run(['sudo', 'apt-get', 'install', '-y', 'python3-pip'], check=True)
+            else:
+                print("Could not install pip automatically. Please install pip manually.")
+                print("You can try: 'sudo dnf install python3-pip' on RHEL/Fedora")
+                sys.exit(1)
+        except subprocess.CalledProcessError:
+            print("Failed to install pip. Please install pip manually.")
+            sys.exit(1)
+
+    print("Checking dependencies...")
+    # Check for missing packages using a fast import-only check
+    missing_packages = []
+    for package_req in REQUIRED_PACKAGES:
+        package_name = package_req.split('>=')[0]
+        try:
+            # Try to import but don't actually use the import
+            __import__(package_name.lower())
+        except ImportError:
+            missing_packages.append(package_req)
+    
+    if missing_packages:
+        print(f"Installing missing dependencies: {', '.join(missing_packages)}")
+        try:
+            # Try using pip in user mode first (no sudo required)
+            subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', '--ignore-installed', '--user', '--no-cache', '--root-user-action=ignore'] + missing_packages, check=True)
+            print("Dependencies installed successfully.")
+            
+            # Save the successful check to config
+            if not config.has_section("dependencies"):
+                config.add_section("dependencies")
+            config.set("dependencies", "last_check", str(time.time()))
+            config.set("dependencies", "packages_checked", ','.join(REQUIRED_PACKAGES))
+            with open(config_path, "w") as f:
+                config.write(f)
+            
+            # Restart the script to reload the modules
+            print("New packages installed. Restarting script to load them...")
+            os.execv(sys.executable, [sys.executable] + sys.argv + [restart_flag])
+            # The script will exit here and restart
+        except subprocess.CalledProcessError:
+            print("\nFailed to install dependencies in user mode.")
+            
+            # Ask for permission to use sudo
+            use_sudo = input("Would you like to try installing with sudo? (yes/no): ").lower() == 'yes'
+            if use_sudo:
+                try:
+                    subprocess.run(['sudo', sys.executable, '-m', 'pip', 'install', '--upgrade', '--ignore-installed', '--user', '--no-cache', '--root-user-action=ignore'] + missing_packages, check=True)
+                    print("Dependencies installed successfully with sudo.")
+                    
+                    # Save the successful check to config
+                    if not config.has_section("dependencies"):
+                        config.add_section("dependencies")
+                    config.set("dependencies", "last_check", str(time.time()))
+                    config.set("dependencies", "packages_checked", ','.join(REQUIRED_PACKAGES))
+                    with open(config_path, "w") as f:
+                        config.write(f)
+                    
+                    # Restart after sudo install too
+                    print("New packages installed. Restarting script to load them...")
+                    os.execv(sys.executable, [sys.executable] + sys.argv + [restart_flag])
+                    # The script will exit here and restart
+                except subprocess.CalledProcessError:
+                    print("Failed to install dependencies with sudo.")
+                    print("Please install the following packages manually:")
+                    for package in missing_packages:
+                        print(f"  - {package}")
+                    sys.exit(1)
+            else:
+                print("Please install the following packages manually:")
+                for package in missing_packages:
+                    print(f"  - {package}")
+                sys.exit(1)
+    else:
+        # All dependencies are installed - update the last check time
+        if not config.has_section("dependencies"):
+            config.add_section("dependencies")
+        config.set("dependencies", "last_check", str(time.time()))
+        config.set("dependencies", "packages_checked", ','.join(REQUIRED_PACKAGES))
+        with open(config_path, "w") as f:
+            config.write(f)
+        
+        print("All dependencies are already installed.")
+        return True
+
+# Run the dependency check when imported
+if check_and_install_dependencies():
+    # Only import packages after successful dependency check
+    try:
+        from github import Github, GithubException, BadCredentialsException, UnknownObjectException
+        import github
+    except ImportError:
+        print("Error: Could not import GitHub modules after installation.")
+        print("Please try running the script again, or install packages manually:")
+        for package in REQUIRED_PACKAGES:
+            print(f"  - {package}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        sys.exit(1)
+        
+    try:
+        from colorama import init, Fore, Style
+        init()
+        colorama_available = True
+    except ImportError:
+        colorama_available = False
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        colorama_available = False
+
+# --- COMMON UTILITY FUNCTIONS ---
+
+def setup_logging():
+    """Set up logging configuration."""
+    log_dir = os.path.expanduser("~/.gh-utils")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "gh-utils.log")
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    return logging.getLogger("gh-utils")
+
+logger = setup_logging()
+
+def init_colors():
+    """Initialize colored output support."""
+    if colorama_available:
+        return {
+            "RED": Fore.RED,
+            "GREEN": Fore.GREEN,
+            "YELLOW": Fore.YELLOW,
+            "BLUE": Fore.BLUE,
+            "RESET": Style.RESET_ALL,
+            "BOLD": Style.BRIGHT
+        }
+    else:
+        return {
+            "RED": "",
+            "GREEN": "",
+            "YELLOW": "",
+            "BLUE": "",
+            "RESET": "",
+            "BOLD": ""
+        }
+
+colors = init_colors()
+
+def run_command(command):
+    """Run a shell command and handle errors."""
+    try:
+        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Git command failed: {e}")
+        print(f"Git command failed: {e}")
+        return None
+
+def show_spinner(message, func, *args, **kwargs):
+    """Show a spinner while executing a function."""
+    spinner = itertools.cycle(['-', '/', '|', '\\'])
+    done = False
+    result = None
+    
+    def spin():
+        sys.stdout.write(message + ' ')
+        while not done:
+            sys.stdout.write(next(spinner))
+            sys.stdout.flush()
+            time.sleep(0.1)
+            sys.stdout.write('\b')
+        sys.stdout.write('\r' + ' ' * (len(message) + 2) + '\r')
+    
+    spinner_thread = threading.Thread(target=spin)
+    spinner_thread.start()
+    
+    try:
+        result = func(*args, **kwargs)
+    finally:
+        done = True
+        spinner_thread.join()
+    
+    return result
+
+def with_progress_bar(iterable, description="Processing"):
+    """Show a progress bar for iteration"""
+    try:
+        from rich.progress import track
+        return track(iterable, description=description)
+    except ImportError:
+        # Fallback to simple progress
+        total = len(iterable) if hasattr(iterable, "__len__") else "?"
+        print(f"{description} (total items: {total})...")
+        return iterable
+
+def show_progress(message):
+    sys.stdout.write(f"\r{message}...")
+    sys.stdout.flush()
+
+# --- AUTHENTICATION AND CONFIGURATION ---
+
+def load_config():
+    """Load saved configuration from ~/.gh-utils.ini"""
+    config_path = os.path.expanduser("~/.gh-utils.ini")
+    if (os.path.exists(config_path)):
+        config = configparser.ConfigParser()
+        config.read(config_path)
+        return config
+    return None
+
+def save_credentials(username, github_token):
+    """Save credentials for future use"""
+    config_path = os.path.expanduser("~/.gh-utils.ini") 
+    config = configparser.ConfigParser()
+    if os.path.exists(config_path):
+        config.read(config_path)
+    
+    if not config.has_section("credentials"):
+        config.add_section("credentials")
+    
+    config.set("credentials", "username", username)
+    config.set("credentials", "token", github_token)
+    
+    with open(config_path, "w") as f:
+        config.write(f)
+    os.chmod(config_path, 0o600)  # Restrict permissions
+
+def get_token_from_keyring():
+    """Get GitHub token from system keyring if available."""
+    try:
+        import keyring
+        token = keyring.get_password("gh-utils", "github-token")
+        if token:
+            return token
+    except ImportError:
+        pass
+    return None
+
+def save_token_to_keyring(token):
+    """Save GitHub token to system keyring if available."""
+    try:
+        import keyring
+        keyring.set_password("gh-utils", "github-token", token)
+        return True
+    except ImportError:
+        return False
+
+def is_valid_branch_name(name):
+    """Check if branch name is valid."""
+    import re
+    return bool(re.match(r'^[a-zA-Z0-9-_/]+$', name))
+
+def get_local_repo_path():
+    """Prompt for the local Git repository path."""
+    # Display current directory before prompting with extra spacing
+    current_dir = os.getcwd()
+    print(f"\n{colors['BLUE']}Current working directory:{colors['RESET']}")
+    print(f"{colors['BOLD']}{current_dir}{colors['RESET']}")
+    print("\n")  # Extra blank line for spacing
+    
+    while True:
+        repo_path = input("Enter the path to your local Git repository: ").strip()
+        if os.path.exists(repo_path) and os.path.isdir(repo_path):
+            git_config_path = os.path.join(repo_path, ".git", "config")
+            if not os.path.exists(os.path.join(repo_path, ".git")):
+                print("The specified directory is not a valid Git repository. Please try again.")
+                continue
+            os.chdir(repo_path)  # Change the working directory to the repo path
+            print(f"\nWorking directory successfully changed to: {repo_path}")
+            return repo_path, git_config_path
+        else:
+            print("\nInvalid path. Please try again.")
+
+def manage_git_config(repo_path, git_config_path):
+    """Check and manage the .git/config file."""
+    config = configparser.ConfigParser()
+
+    # If .git/config does not exist, create it
+    if not os.path.exists(git_config_path):
+        print(f".git/config file not found in {repo_path}. Creating one...")
+        os.makedirs(os.path.join(repo_path, ".git"), exist_ok=True)
+        with open(git_config_path, "w") as f:
+            f.write("[remote \"origin\"]\n")
+            f.write("    url = \n")
+
+    # Load the config file
+    config.read(git_config_path)
+
+    # Check for "url" in the remote "origin" section
+    if "remote \"origin\"" not in config or "url" not in config["remote \"origin\""]:
+        config["remote \"origin\""] = {"url": ""}
+
+    # Parse and validate the existing URL
+    url = config["remote \"origin\""]["url"]
+    existing_username = ""
+    github_token = ""
+    repo_name = ""
+    
+    if "@" in url:
+        credentials_start = url.find("https://") + len("https://")
+        credentials_end = url.find("@")
+        credentials = url[credentials_start:credentials_end]
+        existing_username, github_token = credentials.split(":")
+        
+        # Extract the repository path correctly
+        repo_url_part = url[credentials_end + 1:]
+        if "github.com/" in repo_url_part:
+            github_repo_part = repo_url_part.split("github.com/", 1)[1]
+            if github_repo_part.endswith(".git"):
+                repo_name = github_repo_part[:-4]  # Remove .git extension
+            else:
+                repo_name = github_repo_part
+
+    # Prompt for GitHub username
+    username = input("Enter your GitHub username: ").strip()
+
+    # If the username differs, update the config and prompt for all details
+    if username != existing_username or not url:
+        print("The username in .git/config differs from the entered username. Updating the credentials...")
+        github_token = input("Enter your GitHub personal access token: ").strip()
+        
+        if not repo_name:
+            repo_owner = username  # Default owner is the username
+            repo_project = input("Enter the name of your GitHub repository (e.g., 'ee-containers'): ").strip()
+            repo_name = f"{repo_owner}/{repo_project}"
+
+        # Update the URL in the config file
+        new_url = f"https://{username}:{github_token}@github.com/{repo_name}.git"
+        config["remote \"origin\""]["url"] = new_url
+        with open(git_config_path, "w") as configfile:
+            config.write(configfile)
+        print(f"Updated .git/config with new URL: {new_url}")
+
+    # Ensure github_token and repo_name are always returned
+    if not github_token or not repo_name:
+        print("Error: Could not retrieve valid token or repository path. Exiting.")
+        sys.exit(1)
+
+    return username, github_token, repo_name
+
+def get_github_url():
+    """
+    Get GitHub URL (Enterprise or public GitHub).
+    
+    Returns:
+        str: Base URL for GitHub API access
+    """
+    config = load_config()
+    if (config and config.has_option("github", "url")):
+        return config.get("github", "url")
+    
+    use_enterprise = input("Use GitHub Enterprise? (yes/no): ").strip().lower() == 'yes'
+    if use_enterprise:
+        url = input("Enter GitHub Enterprise URL (e.g., https://github.mycompany.com): ").strip()
+        # Validate URL format
+        if not url.startswith("https://"):
+            print("Warning: URL should start with 'https://'")
+            url = f"https://{url}"
+            
+        # Save to config for future use
+        if load_config():
+            save_github_url(url)
+        return url
+    
+    return "https://github.com"
+
+def save_github_url(url):
+    """Save GitHub URL to configuration file."""
+    config_path = os.path.expanduser("~/.gh-utils.ini")
+    config = configparser.ConfigParser()
+    
+    if os.path.exists(config_path):
+        config.read(config_path)
+    
+    if not config.has_section("github"):
+        config.add_section("github")
+    
+    config.set("github", "url", url)
+    
+    with open(config_path, "w") as f:
+        config.write(f)
+    logger.info(f"Saved GitHub URL {url} to config")
+
+def authenticate_github(github_token, repo_name, github_url="https://github.com"):
+    """
+    Authenticate with GitHub or GitHub Enterprise.
+    
+    Args:
+        github_token (str): GitHub personal access token
+        repo_name (str): Repository name in format "owner/repo"
+        github_url (str): Base GitHub URL for API access
+    
+    Returns:
+        github.Repository.Repository: Authenticated repository object
+        
+    Raises:
+        SystemExit: If authentication fails
+    """
+    try:
+        print(f"Attempting to access repository: {repo_name}")
+        
+        # Create GitHub instance with appropriate base URL
+        if (github_url != "https://github.com"):
+            # For GitHub Enterprise
+            base_api_url = f"{github_url}/api/v3"
+            g = Github(base_url=base_api_url, login_or_token=github_token)
+            logger.info(f"Using GitHub Enterprise API at {base_api_url}")
+        else:
+            # For public GitHub
+            g = Github(github_token)
+            logger.info("Using public GitHub API")
+        
+        # Check rate limit before making API calls
+        check_rate_limit(g)
+        
+        # Get the repository
+        repo = g.get_repo(repo_name)
+        print(f"{colors['GREEN']}✓ Successfully accessed repository: {repo_name}{colors['RESET']}")
+        
+        # Verify we have at least read access by retrieving the default branch
+        default_branch = repo.default_branch
+        logger.info(f"Repository default branch: {default_branch}")
+        
+        return repo
+    except github.BadCredentialsException:
+        logger.error("Authentication failed: Bad credentials")
+        print(f"{colors['RED']}Authentication error: Invalid token or insufficient permissions{colors['RESET']}")
+        print("Please check that your Personal Access Token is valid and has the necessary scopes:")
+        print("  - repo (Full control of private repositories)")
+        print("  - admin:org (if working with organization repositories)")
+        sys.exit(1)
+    except github.UnknownObjectException:
+        logger.error(f"Repository not found: {repo_name}")
+        print(f"{colors['RED']}Error: Repository '{repo_name}' not found{colors['RESET']}")
+        print("Please check that the repository exists and you have access to it.")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Authentication failed: {e}")
+        print(f"{colors['RED']}Authentication error: {e}{colors['RESET']}")
+        print("Please confirm the repository URL and ensure the token has the necessary permissions.")
+        sys.exit(1)
+
+def configure_git_remote(username, github_token, repo_name, github_url="https://github.com"):
+    """
+    Configure git remote with token authentication.
+    
+    Args:
+        username (str): GitHub username
+        github_token (str): GitHub personal access token
+        repo_name (str): Repository name in format "owner/repo"
+        github_url (str): Base GitHub URL
+        
+    Returns:
+        bool: True if configured successfully, False otherwise
+    """
+    # Extract domain from GitHub URL
+    from urllib.parse import urlparse
+    domain = urlparse(github_url).netloc or "github.com"
+    
+    remote_url = f"https://{username}:{github_token}@{domain}/{repo_name}.git"
+    print(f"Configuring remote URL for repository...")
+    
+    # First check if the remote exists
+    remotes = run_command(["git", "remote"])
+    if remotes is None or "origin" not in remotes.split():
+        result = run_command(["git", "remote", "add", "origin", remote_url])
+        if result is None:
+            print(f"{colors['RED']}Failed to add remote 'origin'.{colors['RESET']}")
+            return False
+    else:
+        result = run_command(["git", "remote", "set-url", "origin", remote_url])
+        if result is None:
+            print(f"{colors['RED']}Failed to update remote URL.{colors['RESET']}")
+            return False
+    
+    print(f"{colors['GREEN']}Remote URL configured successfully.{colors['RESET']}")
+    
+    # Fetch to verify connection
+    print("Verifying connection to remote...")
+    fetch_result = run_command(["git", "fetch", "origin"])
+    if fetch_result is None:
+        print(f"{colors['YELLOW']}Warning: Could not fetch from remote. Check network connection.{colors['RESET']}")
+        return False
+        
+    return True
+
+def check_rate_limit(g):
+    """
+    Check GitHub API rate limit and warn if low.
+    
+    Args:
+        g (github.Github): Authenticated GitHub instance
+        
+    Returns:
+        int: Remaining API calls
+    """
+    try:
+        rate_limit = g.get_rate_limit()
+        core_remaining = rate_limit.core.remaining
+        
+        if core_remaining < 20:
+            reset_time = rate_limit.core.reset.strftime('%Y-%m-%d %H:%M:%S')
+            print(f"{colors['YELLOW']}⚠️ Warning: GitHub API rate limit low ({core_remaining} requests remaining){colors['RESET']}")
+            print(f"Rate limit will reset at {reset_time}")
+        
+        logger.info(f"GitHub API rate limit: {core_remaining} remaining requests")
+        return core_remaining
+    except Exception as e:
+        logger.warning(f"Could not check rate limit: {e}")
+        return None
+
+def setup_repo_authentication():
+    """Common authentication flow used across workflows."""
+    # Display current directory before prompting for repo path
+    current_dir = os.getcwd()
+    print(f"\n{colors['BLUE']}Current working directory:{colors['RESET']}")
+    print(f"{colors['BOLD']}{current_dir}{colors['RESET']}")
+    print("\n")  # Extra blank line for spacing
+    
+    repo_path, git_config_path = get_local_repo_path()
+    username, github_token, repo_name = manage_git_config(repo_path, git_config_path)
+    repo = authenticate_github(github_token, repo_name)
+    return repo, repo_path, username, github_token, repo_name
+
+def get_cached_branches(repo):
+    """Cache branches to avoid multiple API calls."""
+    if not hasattr(get_cached_branches, 'cache') or get_cached_branches.cache.get('repo') != repo:
+        get_cached_branches.cache = {
+            'repo': repo,
+            'branches': list(repo.get_branches()),
+            'timestamp': time.time()
+        }
+    return get_cached_branches.cache['branches']
+
+# --- BRANCH MANAGEMENT FUNCTIONS ---
+
+def get_branch_info(repo, for_protection=True):
+    """
+    Get branch information and prompt for branch selection.
+    
+    Args:
+        repo (github.Repository.Repository): GitHub repository object
+        for_protection (bool): True if selecting branch for protection, False for unprotection
+    
+    Returns:
+        str: Selected branch name or None if canceled
+    """
+    try:
+        # Get branches
+        branches = get_cached_branches(repo)
+        
+        # Check if branches is empty
+        if not branches:
+            print(f"{colors['YELLOW']}No branches found in repository.{colors['RESET']}")
+            return None
+            
+        # Format branch information for display
+        action = "protect" if for_protection else "unprotect"
+        branch_names = []
+        
+        # Try to use enhanced UI if available
+        try:
+            import questionary
+            from rich.console import Console
+            console = Console()
+            enhanced_ui = True
+            console.print(f"\n[bold]Select branch to {action}:[/bold]")
+        except ImportError:
+            enhanced_ui = False
+            print(f"\nAvailable branches to {action}:")
+        
+        # List branches with protection status
+        for idx, branch in enumerate(branches, 1):
+            is_protected = branch.name in PROTECTED_BRANCHES
+            branch_names.append(branch.name)
+            
+            # Only show branches that make sense for the operation
+            # (unprotected branches for protection, protected branches for unprotection)
+            if (for_protection and not is_protected) or (not for_protection and is_protected):
+                if enhanced_ui:
+                    protection_status = f"[yellow](protected)[/yellow]" if is_protected else ""
+                    console.print(f"  {idx}. {branch.name} {protection_status}")
+                else:
+                    protection_status = f" {colors['YELLOW']}(protected){colors['RESET']}" if is_protected else ""
+                    print(f"  {idx}. {branch.name}{protection_status}")
+        
+        # If no eligible branches found
+        eligible_branches = [b.name for b in branches if (for_protection and b.name not in PROTECTED_BRANCHES) or 
+                                                        (not for_protection and b.name in PROTECTED_BRANCHES)]
+        if not eligible_branches:
+            action_msg = "protect" if for_protection else "unprotect"
+            no_branches_msg = f"No {'un' if for_protection else ''}protected branches found to {action_msg}."
+            if enhanced_ui:
+                console.print(f"[yellow]{no_branches_msg}[/yellow]")
+            else:
+                print(f"{colors['YELLOW']}{no_branches_msg}{colors['RESET']}")
+            return None
+        
+        # Handle branch selection
+        if enhanced_ui:
+            branch_name = questionary.select(
+                f"Select branch to {action}:",
+                choices=eligible_branches
+            ).ask()
+        else:
+            choice = input(f"\nEnter branch number to {action} (0 to cancel): ").strip()
+            if not choice or choice == "0":
+                return None
+            
+            try:
+                index = int(choice) - 1
+                if 0 <= index < len(eligible_branches):
+                    branch_name = eligible_branches[index]
+                else:
+                    print("Invalid branch number.")
+                    return None
+            except ValueError:
+                print("Invalid input. Please enter a number.")
+                return None
+        
+        return branch_name
+        
+    except Exception as e:
+        logger.error(f"Error getting branch information: {e}")
+        print(f"{colors['RED']}Error getting branch information: {e}{colors['RESET']}")
+        return None
+
+def protect_branch(repo, branch_name):
+    """
+    Apply branch protection rules to a repository branch.
+
+    Args:
+        repo (github.Repository.Repository): GitHub repository object.
+        branch_name (str): Name of the branch to protect.
+
+    Returns:
+        bool: True if protection was successful, False otherwise.
+    """
+    if not branch_name:
+        return False
+
+    try:
+        # Check if branch exists
+        try:
+            branch = repo.get_branch(branch_name)
+        except github.GithubException as e:
+            if e.status == 404:
+                print(f"{colors['RED']}Branch '{branch_name}' does not exist in this repository.{colors['RESET']}")
+                return False
+            raise
+        # Check if branch already has protection
+        try:
+            existing_protection = branch.get_protection()
+            print(f"{colors['YELLOW']}Branch '{branch_name}' already has protection rules.{colors['RESET']}")
+            modify_existing = input("Do you want to modify the existing protection rules? (yes/no): ").strip().lower() == "yes"
+            if not modify_existing:
+                return False
+        except github.GithubException:
+            # No protection exists, which is fine
+            pass
+        
+        # Enhanced UI if available
+        try:
+            import questionary
+            from rich.console import Console
+            from rich.panel import Panel
+            console = Console()
+            console.print(Panel.fit(
+                f"[bold]Branch Protection Configuration for '{branch_name}'[/bold]",
+                border_style="blue"
+            ))
+            enhanced_ui = True
+        except ImportError:
+            print("\nBranch Protection Configuration:")
+            print("-" * 40)
+            enhanced_ui = False
+        
+        # Define protection options with simpler interaction
+        protection_config = {}
+            
+        # Pull request review requirements
+        if enhanced_ui:
+            require_pr = questionary.confirm("Require pull request reviews before merging?").ask()
+        else:
+            require_pr = input("Require pull request reviews before merging? (y/n): ").strip().lower() == 'y'
+        protection_config["require_pr"] = require_pr
+        if require_pr:
+            if enhanced_ui:
+                required_approvals = questionary.select(
+                    "Number of required approving reviews:",
+                    choices=["1", "2", "3", "4", "5", "6"],
+                    default="1"
+                ).ask()
+                required_approvals = int(required_approvals)
+                dismiss_stale_reviews = questionary.confirm(
+                    "Dismiss stale reviews when new commits are pushed?"
+                ).ask()
+                require_code_owner_reviews = questionary.confirm(
+                    "Require review from code owners?"
+                ).ask()
+            else:
+                try:
+                    required_approvals = int(input("Number of required approving reviews (1-6): ").strip())
+                    if required_approvals < 1 or required_approvals > 6:
+                        required_approvals = 1
+                        print("Invalid input. Using default: 1 approving review.")
+                except ValueError:
+                    required_approvals = 1
+                    print("Invalid input. Using default: 1 approving review.")
+                dismiss_stale_reviews = input("Dismiss stale reviews when new commits are pushed? (y/n): ").strip().lower() == 'y'
+                require_code_owner_reviews = input("Require review from code owners? (y/n): ").strip().lower() == 'y'
+                    
+            protection_config["required_approvals"] = required_approvals
+            protection_config["dismiss_stale_reviews"] = dismiss_stale_reviews
+            protection_config["require_code_owner_reviews"] = require_code_owner_reviews
+        
+        # Status check requirements
+        if enhanced_ui:
+            require_status_checks = questionary.confirm("Require status checks to pass before merging?").ask()
+        else:
+            require_status_checks = input("Require status checks to pass before merging? (y/n): ").strip().lower() == 'y'
+        protection_config["require_status_checks"] = require_status_checks
+        if require_status_checks:
+            if enhanced_ui:
+                strict = questionary.confirm("Require branches to be up to date before merging?").ask()
+            else:
+                strict = input("Require branches to be up to date before merging? (y/n): ").strip().lower() == 'y'
+            protection_config["strict"] = strict
+            # Status check contexts
+            contexts = []
+            if enhanced_ui:
+                add_checks = questionary.confirm("Add specific status checks?").ask()
+            else:
+                add_checks = input("Add specific status checks? (y/n): ").strip().lower() == 'y'
+            if add_checks:
+                print("Enter status check names one per line (press Enter twice when done):")
+                while True:
+                    check = input().strip()
+                    if not check:
+                        break
+                    contexts.append(check)
+            protection_config["contexts"] = contexts
+        
+        # Admin enforcement and other options
+        if enhanced_ui:
+            include_admins = questionary.confirm("Enforce rules for administrators too?").ask()
+            allow_force_pushes = questionary.confirm("Allow force pushes?").ask()
+            allow_deletions = questionary.confirm("Allow branch deletion?").ask()
+        else:
+            include_admins = input("Enforce all restrictions for administrators too? (y/n): ").strip().lower() == 'y'
+            allow_force_pushes = input("Allow force pushes? (y/n): ").strip().lower() == 'y'
+            allow_deletions = input("Allow branch deletion? (y/n): ").strip().lower() == 'y'
+        protection_config["include_admins"] = include_admins
+        protection_config["allow_force_pushes"] = allow_force_pushes
+        protection_config["allow_deletions"] = allow_deletions
+        
+        # Display summary of protection settings
+        if enhanced_ui:
+            console.print("\n[bold blue]Protection Summary:[/bold blue]")
+            console.print(f"• Pull request reviews: {'[green]Required[/green]' if require_pr else '[yellow]Not required[/yellow]'}")
+            if require_pr:
+                console.print(f"  - Required approvals: [cyan]{required_approvals}[/cyan]")
+                console.print(f"  - Dismiss stale reviews: {'[green]Yes[/green]' if dismiss_stale_reviews else '[yellow]No[/yellow]'}")
+                console.print(f"  - Require code owner reviews: {'[green]Yes[/green]' if require_code_owner_reviews else '[yellow]No[/yellow]'}")
+            console.print(f"• Status checks: {'[green]Required[/green]' if require_status_checks else '[yellow]Not required[/yellow]'}")
+            if require_status_checks:
+                console.print(f"  - Require up-to-date branches: {'[green]Yes[/green]' if strict else '[yellow]No[/yellow]'}")
+                if contexts:
+                    console.print(f"  - Required status checks: [cyan]{', '.join(contexts)}[/cyan]")
+            console.print(f"• Admin enforcement: {'[green]Yes[/green]' if include_admins else '[yellow]No[/yellow]'}")
+            console.print(f"• Force pushes: {'[green]Allowed[/green]' if allow_force_pushes else '[red]Disallowed[/red]'}")
+            console.print(f"• Branch deletion: {'[green]Allowed[/green]' if allow_deletions else '[red]Disallowed[/red]'}")
+            confirm = questionary.confirm(f"Apply these protection rules to '{branch_name}'?").ask()
+        else:
+            # Traditional display
+            print(f"\n{colors['BLUE']}Protection Summary for '{branch_name}':{colors['RESET']}")
+            print(f"- Pull request reviews: {'Required' if require_pr else 'Not required'}")
+            if require_pr:
+                print(f"  - Required approvals: {required_approvals}")
+                print(f"  - Dismiss stale reviews: {'Yes' if dismiss_stale_reviews else 'No'}")
+                print(f"  - Require code owner reviews: {'Yes' if require_code_owner_reviews else 'No'}")
+            print(f"- Status checks: {'Required' if require_status_checks else 'Not required'}")
+            if require_status_checks:
+                print(f"  - Require up-to-date branches: {'Yes' if strict else 'No'}")
+                if contexts:
+                    print(f"  - Required status checks: {', '.join(contexts)}")
+            print(f"- Admin enforcement: {'Yes' if include_admins else 'No'}")
+            print(f"- Force pushes: {'Allowed' if allow_force_pushes else 'Disallowed'}")
+            print(f"- Branch deletion: {'Allowed' if allow_deletions else 'Disallowed'}")
+            confirm = input(f"\nApply these protection rules to '{branch_name}'? (yes/no): ").strip().lower() == "yes"
+        if not confirm:
+            print("Branch protection cancelled.")
+            return False
+        
+        # Apply branch protection rules with progress feedback
+        print(f"\nApplying protection rules to branch '{branch_name}'...")
+            
+        def apply_protection():
+            branch.edit_protection(
+                # Review protection
+                required_approving_review_count=protection_config.get("required_approvals") if protection_config.get("require_pr") else None,
+                dismiss_stale_reviews=protection_config.get("dismiss_stale_reviews", False),
+                require_code_owner_reviews=protection_config.get("require_code_owner_reviews", False),
+                # Status check protection
+                strict=protection_config.get("strict") if protection_config.get("require_status_checks") else None,
+                contexts=protection_config.get("contexts", []) if protection_config.get("require_status_checks") else [],
+                # Other protections
+                enforce_admins=protection_config.get("include_admins", False),
+                user_push_restrictions=None,  # Not implemented in this version
+                team_push_restrictions=None,  # Not implemented in this version
+                allow_force_pushes=protection_config.get("allow_force_pushes", False),
+                allow_deletions=protection_config.get("allow_deletions", False)
+            )
+            return True
+        result = show_spinner("Applying branch protection", apply_protection)
+        if result:
+            print(f"{colors['GREEN']}✓ Branch protection rules successfully applied to branch '{branch_name}'.{colors['RESET']}")
+            logger.info(f"Applied protection to branch '{branch_name}'")
+            # Add branch to protected branches list for future reference
+            if branch_name not in PROTECTED_BRANCHES:
+                PROTECTED_BRANCHES.append(branch_name)
+            return True
+        else:
+            print(f"{colors['RED']}Failed to apply branch protection.{colors['RESET']}")
+            return False
+    except github.GithubException as e:
+        logger.error(f"GitHub API error applying branch protection: {e}")
+        print(f"{colors['RED']}Error applying branch protection: {e}{colors['RESET']}")
+        print("Make sure your token has admin permissions for this repository.")
+        if e.status == 403:
+            print(f"{colors['YELLOW']}Permission denied. This usually happens when your token lacks 'Admin' repository permissions.{colors['RESET']}")
+            print("For private repositories, ensure your token has the 'repo' scope.")
+            print("For public repositories, ensure your token has the 'public_repo' scope.")
+        return False
+    except Exception as e:
+        logger.error(f"Error applying branch protection: {e}")
+        print(f"{colors['RED']}Error applying branch protection: {e}{colors['RESET']}")
+        return False
+
+def remove_branch_protection(repo, branch_name):
+    """
+    Remove branch protection rules from a repository branch.
+
+    Args:
+        repo (github.Repository): GitHub repository object.
+        branch_name (str): Name of the branch to unprotect.
+
+    Returns:
+        bool: True if protection removal was successful, False otherwise.
+    """ 
+    if not branch_name:
+        return False
+        
+    try:
+        # Check if branch exists
+        try:
+            branch = repo.get_branch(branch_name)
+        except github.GithubException as e:
+            if e.status == 404:
+                print(f"{colors['RED']}Branch '{branch_name}' does not exist in this repository.{colors['RESET']}")
+                return False
+            raise
+        # Check if branch actually has protection rules
+        has_protection = True
+        try:
+            branch.get_protection()
+        except github.GithubException as e:
+            if e.status == 404:
+                has_protection = False
+                print(f"{colors['YELLOW']}Branch '{branch_name}' does not have protection rules to remove.{colors['RESET']}")
+                return True  # Not an error, just no protection to remove
+            raise
+        if has_protection:
+            # Enhanced UI if available
+            try:
+                import questionary
+                from rich.console import Console
+                console = Console()
+                console.print(f"[bold red]⚠️ Warning: Removing protection from branch '{branch_name}'[/bold red]")
+                console.print("This will disable all branch protection rules including:")
+                console.print("- Pull request requirements")
+                console.print("- Status check requirements")
+                console.print("- Branch restriction rules")
+                confirm = questionary.confirm(
+                    f"Are you sure you want to remove protection from branch '{branch_name}'?",
+                    default=False
+                ).ask()
+            except ImportError:
+                # Traditional confirmation
+                print(f"{colors['RED']}⚠️ Warning: Removing protection from branch '{branch_name}'{colors['RESET']}")
+                print("This will disable all branch protection rules.")
+                confirm = input(f"Are you sure you want to remove protection from branch '{branch_name}'? (yes/no): ").strip().lower() == "yes"
+            if not confirm:
+                print("Branch protection removal cancelled.")
+                return False
+            
+            # Disable branch protection rules with visual feedback
+            print(f"Removing branch protection rules from branch: {branch_name}")
+            
+            def remove_protection():
+                branch.remove_protection()
+                return True
+            result = show_spinner("Removing branch protection", remove_protection)
+            if result:
+                print(f"{colors['GREEN']}✓ Branch protection rules removed from branch '{branch_name}'.{colors['RESET']}")
+                logger.info(f"Removed protection from branch '{branch_name}'")
+                # Remove from protected branches list if it's there
+                if branch_name in PROTECTED_BRANCHES:
+                    PROTECTED_BRANCHES.remove(branch_name)
+                return True
+            else:
+                print(f"{colors['RED']}Failed to remove branch protection.{colors['RESET']}")
+                return False
+        return True  # No protection to remove
+    except github.GithubException as e:
+        logger.error(f"GitHub API error removing branch protection: {e}")
+        print(f"{colors['RED']}Error removing branch protection: {e}{colors['RESET']}")
+        if e.status == 403:
+            print(f"{colors['YELLOW']}Permission denied. Make sure your token has admin permissions for this repository.{colors['RESET']}")
+            
+        return False
+    except Exception as e:
+        logger.error(f"Error removing branch protection: {e}")
+        print(f"{colors['RED']}Error removing branch protection: {e}{colors['RESET']}")
+        return False
+
+def show_branch_graph(repo):
+    """
+    Show visual representation of branches and their relationships.
+    
+    Args:
+        repo (github.Repository): GitHub repository object
+        
+    Returns:
+        bool: True if visualization was successful, False otherwise
+    """ 
+    try:
+        # Try to use rich for enhanced visualization
+        from rich.console import Console
+        from rich.tree import Tree
+        from rich.panel import Panel
+        console = Console()
+        
+        # Get branch relationships
+        branches = get_cached_branches(repo)
+        default_branch = repo.default_branch
+        
+        console.print(Panel.fit(
+            f"[bold]Branch Structure for {repo.full_name}[/bold]",
+            border_style="blue"
+        ))
+        
+        # Create branch tree with default branch as root
+        tree = Tree(f"[bold green]{default_branch}[/bold green]")
+        
+        # Get commit dates and PR info for sorting and display
+        branch_details = []
+        with console.status("[cyan]Analyzing branch relationships...[/cyan]"):
+            for branch in branches:
+                if branch.name != default_branch:
+                    try:
+                        # Get most recent commit
+                        commits = list(repo.get_commits(sha=branch.name, per_page=1))
+                        commit_date = commits[0].commit.author.date if commits else None
+                        # Check for PRs associated with this branch
+                        pulls = list(repo.get_pulls(head=f"{repo.owner.login}:{branch.name}", 
+                                                base=default_branch, 
+                                                state="open"))
+                        pr_info = pulls[0] if pulls else None
+                        branch_details.append({
+                            "name": branch.name,
+                            "date": commit_date,
+                            "protected": branch.name in PROTECTED_BRANCHES,
+                            "pr": pr_info
+                        })
+                    except Exception:
+                        branch_details.append({
+                            "name": branch.name,
+                            "date": None,
+                            "protected": branch.name in PROTECTED_BRANCHES,
+                            "pr": None
+                        })
+        
+        # Sort branches by commit date if available
+        branch_details.sort(key=lambda x: (x["date"] is None, x["date"] if x["date"] else ""), reverse=True)
+        
+        # Add branches to tree
+        for branch in branch_details:
+            # Format branch label with status indicators
+            label = f"[cyan]{branch['name']}[/cyan]"
+            if branch["protected"]:
+                label += " [yellow]🔒[/yellow]"
+                
+            # Create branch node
+            branch_node = tree.add(label)
+                
+            # Add PR information if exists
+            if branch["pr"]:
+                pr = branch["pr"]
+                status = "[green]✓ Ready[/green]" if pr.mergeable else "[red]× Conflicts[/red]"
+                branch_node.add(f"[bold]PR #{pr.number}[/bold]: {pr.title} ({status})")
+                
+            # Add last commit info if available
+            if branch["date"]:
+                date_str = branch["date"].strftime("%Y-%m-%d %H:%M")
+                branch_node.add(f"Last updated: [yellow]{date_str}[/yellow]")
+        
+        # Print the tree
+        console.print(tree)
+        
+        # Display a legend
+        console.print("\n[bold]Legend:[/bold]")
+        console.print("[yellow]🔒[/yellow] Protected branch")
+        console.print("[green]✓ Ready[/green] PR ready to merge")
+        console.print("[red]× Conflicts[/red] PR has conflicts")
+        
+        return True
+    except ImportError:
+        # Fallback to simple text visualization
+        print("\nRepository Branch Structure:")
+        print("==========================")
+        try:
+            branches = get_cached_branches(repo)
+            default_branch = repo.default_branch
+            
+            print(f"* {default_branch} (default)")
+            
+            for branch in branches:
+                if (branch.name != default_branch):
+                    protected = f" {colors['YELLOW']}(protected){colors['RESET']}" if branch.name in PROTECTED_BRANCHES else ""
+                    print(f"  ├─ {branch.name}{protected}")
+                    
+                    # Try to check for PRs
+                    try:
+                        pulls = list(repo.get_pulls(head=f"{repo.owner.login}:{branch.name}", 
+                                               base=default_branch, 
+                                               state="open"))
+                        if pulls:
+                            pr = pulls[0]
+                            status = f"{colors['GREEN']}[Ready]{colors['RESET']}" if pr.mergeable else f"{colors['RED']}[Conflicts]{colors['RESET']}"
+                            print(f"     └─ PR #{pr.number}: {pr.title} {status}")
+                    except:
+                        pass
+            
+            return True
+        except Exception as e:
+            print(f"Error visualizing branches: {e}")
+            return False
+
+def branch_protection_workflow():
+    """Interactive workflow for managing branch protection rules."""
+    try:
+        # Check for rich UI
+        try:
+            import questionary
+            from rich.console import Console
+            console = Console()
+            enhanced_ui = True
+            console.print(f"\n[bold]Branch Protection Management[/bold]")
+            action = questionary.select(
+                "What would you like to do?",
+                choices=[
+                    "Apply branch protection",
+                    "Remove branch protection",
+                    "Show branch status",
+                    "Return to main menu"
+                ]
+            ).ask()
+        except ImportError:
+            enhanced_ui = False
+            print("\nBranch Protection Management")
+            print("===========================")
+            print("1. Apply branch protection")
+            print("2. Remove branch protection")
+            print("3. Show branch status")
+            print("4. Return to main menu")
+            action = input("\nSelect an option (1-4): ").strip()
+            # Map input to actions
+            action_map = {
+                "1": "Apply branch protection",
+                "2": "Remove branch protection", 
+                "3": "Show branch status",
+                "4": "Return to main menu"
+            }
+            action = action_map.get(action, "Return to main menu")
+        
+        # Setup authentication
+        repo, repo_path, username, github_token, repo_name = setup_repo_authentication()
+        
+        if action == "Apply branch protection":
+            branch_name = get_branch_info(repo, for_protection=True)
+            if branch_name:
+                protect_branch(repo, branch_name)
+        elif action == "Remove branch protection":
+            branch_name = get_branch_info(repo, for_protection=False)
+            if branch_name:
+                remove_branch_protection(repo, branch_name)
+        elif action == "Show branch status":
+            show_branch_graph(repo)
+            
+    except Exception as e:
+        logger.error(f"Error managing branch protection: {e}")
+        print(f"{colors['RED']}Error managing branch protection: {e}{colors['RESET']}")
+    
+    # This should be outside the try block
+    if 'enhanced_ui' in locals() and enhanced_ui:
+        input("\n[Press Enter to continue]")
+    else:
+        input("\nPress Enter to continue...")
+
+def delete_branch_workflow():
+    """Workflow for deleting a branch."""
+    print(f"\n{colors['BOLD']}--- Delete Branch ---{colors['RESET']}")
+    
+    # Setup authentication
+    repo, repo_path, username, github_token, repo_name = setup_repo_authentication()
+    
+    # Get branches
+    branches = get_cached_branches(repo)
+    if not branches:
+        print(f"{colors['YELLOW']}No branches found in repository.{colors['RESET']}")
+        return
+    
+    default_branch = repo.default_branch
+    eligible_branches = [branch.name for branch in branches if branch.name != default_branch]
+    
+    if not eligible_branches:
+        print(f"{colors['YELLOW']}No branches available to delete (excluding default branch).{colors['RESET']}")
+        return
+    
+    # Try to use enhanced UI if available
+    try:
+        import questionary
+        from rich.console import Console
+        console = Console()
+        enhanced_ui = True
+        
+        branch_to_delete = questionary.select(
+            "Select branch to delete:",
+            choices=eligible_branches
+        ).ask()
+    except ImportError:
+        enhanced_ui = False
+        print("\nAvailable branches to delete:")
+        
+        for idx, branch_name in enumerate(eligible_branches, 1):
+            print(f"{idx}. {branch_name}")
+        
+        choice = input("\nSelect branch number to delete (0 to cancel): ").strip()
+        if not choice or choice == "0":
+            return
+        
+        try:
+            index = int(choice) - 1
+            if 0 <= index < len(eligible_branches):
+                branch_to_delete = eligible_branches[index]
+            else:
+                print("Invalid branch number.")
+                return
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+            return
+    
+    # Confirm deletion
+    confirm_msg = f"Are you sure you want to delete branch '{branch_to_delete}'? This cannot be undone!"
+    if enhanced_ui:
+        confirm = questionary.confirm(confirm_msg, default=False).ask()
+    else:
+        confirm = input(f"{colors['RED']}{confirm_msg}{colors['RESET']} (yes/no): ").strip().lower() == "yes"
+    
+    if not confirm:
+        print("Branch deletion cancelled.")
+        return
+    
+    # Perform the deletion
+    try:
+        print(f"Deleting branch '{branch_to_delete}'...")
+        
+        def delete_branch():
+            repo.get_git_ref(f"heads/{branch_to_delete}").delete()
+            return True
+        
+        result = show_spinner("Deleting branch", delete_branch)
+        
+        if result:
+            print(f"{colors['GREEN']}✓ Branch '{branch_to_delete}' successfully deleted.{colors['RESET']}")
+            logger.info(f"Deleted branch '{branch_to_delete}'")
+        else:
+            print(f"{colors['RED']}Failed to delete branch.{colors['RESET']}")
+    except github.GithubException as e:
+        logger.error(f"GitHub API error deleting branch: {e}")
+        print(f"{colors['RED']}Error deleting branch: {e}{colors['RESET']}")
+        if e.status == 403:
+            print(f"{colors['YELLOW']}You might not have permission to delete this branch.{colors['RESET']}")
+    except Exception as e:
+        logger.error(f"Error deleting branch: {e}")
+        print(f"{colors['RED']}Error deleting branch: {e}{colors['RESET']}")
+
+# --- PULL REQUEST FUNCTIONS ---
+
+def list_open_pull_requests(repo):
+    """
+    List all open pull requests in the repository.
+    
+    Args:
+        repo (github.Repository): GitHub repository object
+        
+    Returns:
+        github.PullRequest.PullRequest or None: Selected pull request or None if canceled
+    """ 
+    try:
+        print("\nFetching open pull requests...")
+        
+        def get_pulls():
+            return list(repo.get_pulls(state='open'))
+            
+        pull_list = show_spinner("Loading pull requests", get_pulls)
+        if not pull_list:
+            print(f"{colors['YELLOW']}No open pull requests found.{colors['RESET']}")
+            return None
+        
+        print(f"\n{colors['BLUE']}=== Open Pull Requests ==={colors['RESET']}")
+        for i, pr in enumerate(pull_list, start=1):
+            status = f"{colors['GREEN']}✓ Ready{colors['RESET']}" if pr.mergeable else f"{colors['RED']}× Conflicts{colors['RESET']}"
+            print(f"{i}. #{pr.number}: {pr.title}")
+            print(f"   From: {pr.head.ref} → To: {pr.base.ref}")
+            print(f"   By: {pr.user.login} | Created: {pr.created_at.strftime('%Y-%m-%d %H:%M')}")
+            print(f"   Status: {status}")
+            print("-" * 50)
+        choice = input("\nSelect a PR number to review (0 to cancel): ").strip()
+        if not choice or choice == "0":
+            return None
+            
+        try:
+            choice_num = int(choice)
+            if 1 <= choice_num <= len(pull_list):
+                return pull_list[choice_num-1]
+            else:
+                print("Invalid selection.")
+                return None
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+            return None
+    except Exception as e:
+        logger.error(f"Error listing pull requests: {e}")
+        print(f"{colors['RED']}Error listing pull requests: {e}{colors['RESET']}")
+        return None
+
+def review_pull_request(repo, pr):
+    """
+    Review the details of a pull request.
+    
+    Args:
+        repo (github.Repository): GitHub repository object
+        pr (github.PullRequest.PullRequest): Pull request to review
+        
+    Returns:
+        github.PullRequest.PullRequest or None: Reviewed PR or None on error
+    """ 
+    if not pr:
+        return None
+        
+    try:
+        print("\n" + "=" * 60)
+        print(f"Pull Request #{pr.number}: {pr.title}")
+        print("=" * 60)
+        print(f"Author: {pr.user.login}")
+        print(f"Created: {pr.created_at.strftime('%Y-%m-%d %H:%M')}")
+        print(f"Branch: {pr.head.ref} → {pr.base.ref}")
+        print(f"Status: {pr.mergeable_state}")
+        print("-" * 60)
+        
+        # Show PR description
+        print(f"{colors['BLUE']}Description:{colors['RESET']}")
+        print(pr.body if pr.body else "No description provided.")
+        print("-" * 60)
+        
+        # Show commits
+        print(f"{colors['BLUE']}Loading commits...{colors['RESET']}")
+        def get_commits():
+            return list(pr.get_commits())
+        commits = show_spinner("Fetching commits", get_commits)
+        print(f"{colors['BLUE']}Commits ({len(commits)}):{colors['RESET']}")
+        for commit in commits[:5]:  # Limit to first 5 commits
+            print(f"- {commit.commit.message.splitlines()[0][:60]}")
+        if len(commits) > 5:
+            print(f"... and {len(commits) - 5} more commits.")
+        print("-" * 60)
+        
+        # Show files changed
+        print(f"{colors['BLUE']}Loading changed files...{colors['RESET']}")
+        def get_files():
+            return list(pr.get_files())
+        files = show_spinner("Fetching changed files", get_files)
+        print(f"{colors['BLUE']}Files Changed ({len(files)}):{colors['RESET']}")
+        for file in files[:5]:  # Limit to first 5 files
+            status = colors['GREEN'] + "A" if file.status == "added" else \
+                     colors['YELLOW'] + "M" if file.status == "modified" else \
+                     colors['RED'] + "D" if file.status == "removed" else file.status
+            print(f"- [{status}{colors['RESET']}] {file.filename}")
+        if len(files) > 5:
+            print(f"... and {len(files) - 5} more files.")
+        print("-" * 60)
+        
+        # Show review comments
+        print(f"{colors['BLUE']}Loading comments...{colors['RESET']}")
+        def get_comments():
+            return list(pr.get_issue_comments())
+        comments = show_spinner("Fetching comments", get_comments)
+        if comments:
+            print(f"{colors['BLUE']}Comments ({len(comments)}):{colors['RESET']}")
+            for comment in comments[:3]:  # Limit to first 3 comments
+                print(f"- {comment.user.login}: {comment.body[:60]}{'...' if len(comment.body) > 60 else ''}")
+            if len(comments) > 3:
+                print(f"... and {len(comments) - 3} more comments.")
+            print("-" * 60)
+        
+        # Return the PR for further action
+        return pr
+        
+    except Exception as e:
+        logger.error(f"Error reviewing pull request: {e}")
+        print(f"{colors['RED']}Error reviewing pull request: {e}{colors['RESET']}")
+        return None
+
+def approve_pull_request(repo, pr):
+    """
+    Submit an approval review for the pull request.
+    
+    Args:
+        repo (github.Repository): GitHub repository object
+        pr (github.PullRequest.PullRequest): Pull request to approve
+        
+    Returns:
+        bool: Success status of the operation
+    """ 
+    if not pr:
+        return False
+        
+    try:
+        # Ask for approval message
+        print("\nSubmitting approval for this pull request...")
+        approval_message = input("Enter an approval message (optional): ").strip()
+        
+        # Confirm
+        confirm = input("Confirm approval? (yes/no): ").strip().lower()
+        if confirm != "yes":
+            print("Approval cancelled.")
+            return False
+        
+        # Submit the approval
+        def submit_approval():
+            pr.create_review(
+                body=approval_message,
+                event="APPROVE"
+            )
+            return True
+        result = show_spinner("Submitting approval", submit_approval)
+        if result:
+            print(f"{colors['GREEN']}✓ Pull request approved successfully!{colors['RESET']}")
+            logger.info(f"Approved PR #{pr.number}")
+            return True
+        else:
+            print(f"{colors['RED']}Failed to approve pull request.{colors['RESET']}")
+            return False
+    except github.GithubException as e:
+        logger.error(f"GitHub API error approving pull request: {e}")
+        print(f"{colors['RED']}Error approving pull request: {e}{colors['RESET']}")
+        return False
+    except Exception as e:
+        logger.error(f"Error approving pull request: {e}")
+        print(f"{colors['RED']}Error approving pull request: {e}{colors['RESET']}")
+        return False
+
+def merge_pull_request(repo, pr):
+    """
+    Merge the approved pull request.
+    
+    Args:
+        repo (github.Repository): GitHub repository object
+        pr (github.PullRequest.PullRequest): Pull request to merge
+        
+    Returns:
+        bool: Success status of the merge operation
+    """ 
+    if not pr:
+        return False
+        
+    try:
+        # Warning if PR is blocked
+        if pr.mergeable_state == "blocked":
+            print(f"{colors['YELLOW']}⚠️ This PR is currently blocked from merging. Check branch protection rules or CI status.{colors['RESET']}")
+            force_merge = input("Do you want to try merging anyway? (yes/no): ").strip().lower()
+            if force_merge != "yes":
+                return False
+        
+        # Ask for merge method
+        print("\nSelect merge method:")
+        print("1. Create a merge commit")
+        print("2. Squash and merge")
+        print("3. Rebase and merge")
+        merge_choice = input("Enter your choice (1-3): ").strip()
+        merge_method = DEFAULT_MERGE_METHOD  # Default from constants
+        if merge_choice == "2":
+            merge_method = "squash"
+        elif merge_choice == "3":
+            merge_method = "rebase"
+        
+        # Ask for commit message
+        default_commit_msg = f"Merge pull request #{pr.number}: {pr.title}"
+        print(f"\nDefault commit message: {default_commit_msg}")
+        use_default = input("Use default commit message? (yes/no): ").strip().lower()
+        commit_msg = default_commit_msg
+        if use_default != "yes":
+            commit_msg = input("Enter custom commit message: ").strip()
+        
+        # Final confirmation
+        print(f"\n{colors['YELLOW']}⚠️ Ready to merge PR #{pr.number} using {merge_method} method.{colors['RESET']}")
+        confirm = input("Confirm merge? (yes/no): ").strip().lower()
+        if confirm == "yes":
+            def do_merge():
+                return pr.merge(
+                    commit_message=commit_msg,
+                    merge_method=merge_method
+                )
+            result = show_spinner("Merging pull request", do_merge)
+            if result and result.merged:
+                print(f"{colors['GREEN']}✓ Pull request #{pr.number} merged successfully!{colors['RESET']}")
+                logger.info(f"Merged PR #{pr.number} using {merge_method} method")
+                
+                # Ask to delete branch
+                if pr.head.repo.full_name == repo.full_name:  # Only if branch is in the same repo
+                    delete_branch = input("Delete the source branch? (yes/no): ").strip().lower()
+                    if delete_branch == "yes":
+                        def delete_branch_func():
+                            repo.get_git_ref(f"heads/{pr.head.ref}").delete()
+                            return True
+                        branch_deleted = show_spinner(f"Deleting branch '{pr.head.ref}'", delete_branch_func)
+                        if branch_deleted:
+                            print(f"{colors['GREEN']}✓ Branch '{pr.head.ref}' deleted.{colors['RESET']}")
+                            logger.info(f"Deleted branch '{pr.head.ref}'")
+                return True
+            else:
+                print(f"{colors['RED']}Failed to merge: {result.message if hasattr(result, 'message') else 'Unknown error'}{colors['RESET']}")
+                return False
+        else:
+            print("Merge canceled.")
+            return False
+    except github.GithubException as e:
+        logger.error(f"GitHub API error merging pull request: {e}")
+        print(f"{colors['RED']}Error merging pull request: {e}{colors['RESET']}")
+        return False
+    except Exception as e:
+        logger.error(f"Error merging pull request: {e}")
+        print(f"{colors['RED']}Error merging pull request: {e}{colors['RESET']}")
+        return False
+
+# --- WORKFLOW IMPLEMENTATION FUNCTIONS ---
+
+def review_merge_workflow():
+    """Workflow for reviewing and merging pull requests."""
+    print(f"\n{colors['BOLD']}--- Review & Merge Pull Requests ---{colors['RESET']}")
+    
+    # Setup authentication
+    repo, repo_path, username, github_token, repo_name = setup_repo_authentication()
+    
+    # List and select a PR
+    pr = list_open_pull_requests(repo)
+    if not pr:
+        print("No pull request selected. Returning to main menu.")
+        return
+    
+    # Review PR details
+    reviewed_pr = review_pull_request(repo, pr)
+    if not reviewed_pr:
+        return
+    
+    # Actions menu
+    while True:
+        print("\nAvailable actions:")
+        print("1. Approve pull request")
+        print("2. Merge pull request")
+        print("3. Add comment")
+        print("4. View in browser")
+        print("0. Return to main menu")
+        action = input("\nSelect an action (0-4): ").strip()
+        if action == "1":
+            if approve_pull_request(repo, reviewed_pr):
+                # After approval, ask if they want to merge
+                if input("\nDo you want to merge this pull request now? (yes/no): ").strip().lower() == "yes":
+                    merge_pull_request(repo, reviewed_pr)
+                    break
+        elif action == "2":
+            if merge_pull_request(repo, reviewed_pr):
+                break
+        elif action == "3":
+            comment = input("Enter your comment: ").strip()
+            if comment:
+                try:
+                    reviewed_pr.create_issue_comment(comment)
+                    print(f"{colors['GREEN']}Comment posted successfully!{colors['RESET']}")
+                except Exception as e:
+                    print(f"{colors['RED']}Failed to post comment: {e}{colors['RESET']}")
+        elif action == "4":
+            print(f"Opening PR in browser: {reviewed_pr.html_url}")
+            try:
+                import webbrowser
+                webbrowser.open(reviewed_pr.html_url)
+            except Exception:
+                print(f"Could not open browser. URL: {reviewed_pr.html_url}")
+        elif action == "0":
+            break
+        else:
+            print("Invalid selection.")
+
+def push_and_pr_workflow():
+    """Workflow for pushing changes and creating a pull request."""
+    print(f"\n{colors['BOLD']}--- Push Changes & Create Pull Request ---{colors['RESET']}")
+    
+    # Setup authentication
+    repo, repo_path, username, github_token, repo_name = setup_repo_authentication()
+    
+    # Check if there are uncommitted changes
+    print("Checking for uncommitted changes...")
+    status = run_command(["git", "status", "--porcelain"])
+    
+    if not status:
+        print(f"{colors['YELLOW']}No uncommitted changes detected.{colors['RESET']}")
+        confirm = input("Continue anyway? (yes/no): ").strip().lower()
+        if confirm != "yes":
+            return
+    else:
+        print(f"Uncommitted changes detected:")
+        for line in status.split("\n"):
+            if line.strip():
+                print(f"  {line}")
+        
+        # Ask to stage and commit changes
+        stage_all = input("\nStage all changes for commit? (yes/no): ").strip().lower() == "yes"
+        if stage_all:
+            print("Staging changes...")
+            run_command(["git", "add", "."])
+            
+            commit_msg = input("Enter commit message: ").strip()
+            if not commit_msg:
+                print(f"{colors['YELLOW']}Commit message cannot be empty.{colors['RESET']}")
+                return
+            
+            print("Committing changes...")
+            result = run_command(["git", "commit", "-m", commit_msg])
+            if result is None:
+                print(f"{colors['RED']}Failed to commit changes.{colors['RESET']}")
+                return
+    
+    # Get current branch
+    current_branch = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    if not current_branch:
+        print(f"{colors['RED']}Failed to determine current branch.{colors['RESET']}")
+        return
+    
+    print(f"Current branch: {current_branch}")
+    
+    # Push changes
+    push_changes = input("Push changes to remote branch? (yes/no): ").strip().lower() == "yes"
+    if push_changes:
+        print(f"Pushing changes to origin/{current_branch}...")
+        result = run_command(["git", "push", "-u", "origin", current_branch])
+        if result is None:
+            print(f"{colors['RED']}Failed to push changes.{colors['RESET']}")
+            return
+        print(f"{colors['GREEN']}✓ Changes pushed successfully.{colors['RESET']}")
+    
+    # Create PR if desired
+    create_pr = input("Create a pull request? (yes/no): ").strip().lower() == "yes"
+    if create_pr:
+        # Get default branch
+        default_branch = repo.default_branch
+        
+        # Only offer to create PR if not already on default branch
+        if current_branch == default_branch:
+            print(f"{colors['YELLOW']}You're already on the default branch ({default_branch}).{colors['RESET']}")
+            print("Pull requests are typically created from feature branches to the default branch.")
+            return
+        
+        # Check if PR already exists
+        existing_prs = list(repo.get_pulls(state="open", head=f"{repo.owner.login}:{current_branch}", base=default_branch))
+        if existing_prs:
+            pr = existing_prs[0]
+            print(f"{colors['YELLOW']}A pull request already exists for this branch:{colors['RESET']}")
+            print(f"#{pr.number}: {pr.title}")
+            print(f"URL: {pr.html_url}")
+            
+            update_pr = input("Do you want to update the PR description? (yes/no): ").strip().lower() == "yes"
+            if not update_pr:
+                return
+            
+            # Update existing PR
+            title = input(f"Enter PR title [{pr.title}]: ").strip()
+            if not title:
+                title = pr.title
+            
+            body = input(f"Enter PR description [{pr.body}]: ").strip()
+            if not body:
+                body = pr.body
+            
+            pr.edit(title=title, body=body)
+            print(f"{colors['GREEN']}✓ Pull request updated.{colors['RESET']}")
+            print(f"URL: {pr.html_url}")
+        else:
+            # Create new PR
+            title = input("Enter PR title: ").strip()
+            if not title:
+                print(f"{colors['YELLOW']}PR title cannot be empty.{colors['RESET']}")
+                return
+            
+            body = input("Enter PR description (optional): ").strip()
+            
+            try:
+                pr = repo.create_pull(
+                    title=title,
+                    body=body,
+                    head=current_branch,
+                    base=default_branch
+                )
+                print(f"{colors['GREEN']}✓ Pull request created successfully!{colors['RESET']}")
+                print(f"URL: {pr.html_url}")
+                logger.info(f"Created PR #{pr.number}: {title}")
+            except github.GithubException as e:
+                logger.error(f"GitHub API error creating PR: {e}")
+                print(f"{colors['RED']}Error creating pull request: {e}{colors['RESET']}")
+            except Exception as e:
+                logger.error(f"Error creating PR: {e}")
+                print(f"{colors['RED']}Error creating pull request: {e}{colors['RESET']}")
+
+# --- REPOSITORY CREATION FUNCTIONS ---
+
+def create_github_repo(g, repo_name, description="", private=True, auto_init=False):
+    """
+    Create a new GitHub repository.
+    
+    Args:
+        g (github.Github): Authenticated GitHub instance
+        repo_name (str): Repository name (without owner)
+        description (str): Repository description
+        private (bool): Whether the repository should be private
+        auto_init (bool): Whether to initialize with README
+        
+    Returns:
+        github.Repository.Repository: Created repository object or None if failed
+    """ 
+    try:
+        # Remove any username prefix from the repository name
+        if "/" in repo_name:
+            print(f"{colors['YELLOW']}⚠️ Repository name contains '/'. Removing owner prefix.{colors['RESET']}")
+            repo_name = repo_name.split("/")[-1]
+            print(f"Using repository name: {repo_name}")
+            
+        # Check if the repo already exists
+        user = g.get_user()
+        
+        # Check if repo name is same as username (not allowed by GitHub)
+        if repo_name.lower() == user.login.lower():
+            print(f"{colors['RED']}Error: Cannot create a repository with the same name as your username ({user.login}){colors['RESET']}")
+            print("GitHub doesn't allow creating standard repositories with the same name as your username.")
+            print("Please choose a different repository name.")
+            return None
+            
+        full_repo_name = f"{user.login}/{repo_name}"
+        
+        print(f"Creating new repository: {full_repo_name}")
+        try:
+            # Try to get the repo - if it exists, this will succeed
+            existing_repo = g.get_repo(full_repo_name)
+            print(f"{colors['YELLOW']}⚠️ Repository already exists at: {existing_repo.html_url}{colors['RESET']}")
+            print(f"Consider using a different name or using the existing repository.")
+            confirm = input("Do you want to use the existing repository? (yes/no): ").strip().lower()
+            if confirm == "yes":
+                return existing_repo
+            else:
+                return None
+        except github.GithubException:
+            # Repo doesn't exist, proceed with creation
+            pass
+        
+        # Check if name is valid (avoid assertion errors)
+        if not repo_name or not repo_name.strip():
+            print(f"{colors['RED']}Invalid repository name: name cannot be empty{colors['RESET']}")
+            return None
+            
+        # Print parameters for debugging
+        print(f"Creating repository with parameters:")
+        print(f"- Name: {repo_name}")
+        print(f"- Description: {description}")
+        print(f"- Private: {private}")
+        print(f"- Auto init: {auto_init}")
+        
+        # Create the new repository
+        new_repo = user.create_repo(
+            name=repo_name,
+            description=description,
+            private=private,
+            auto_init=auto_init,
+            license_template="mit" if auto_init else None
+        )
+        print(f"{colors['GREEN']}✓ Repository created successfully: {new_repo.html_url}{colors['RESET']}")
+        logger.info(f"Created repository: {new_repo.full_name}")
+        return new_repo
+    except AssertionError as e:
+        # Handle assertion errors specifically
+        error_msg = str(e) if str(e) else "Repository name may already exist or be invalid"
+        logger.error(f"Assertion error creating repository: {error_msg}")
+        print(f"{colors['RED']}Error creating repository: {error_msg}{colors['RESET']}")
+        print("This usually happens when a repository with this name already exists in your account.")
+        print(f"Check if '{repo_name}' already exists at https://github.com/{user.login}")
+        return None
+    except github.GithubException as e:
+        error_msg = f"GitHub API error: {str(e.data)}" if hasattr(e, 'data') else str(e)
+        logger.error(f"GitHub API error creating repository: {error_msg}")
+        print(f"{colors['RED']}Error creating repository: {error_msg}{colors['RESET']}")
+        if e.status == 422:
+            print("This usually means a repository with this name already exists or the name is invalid.")
+        return None
+    except Exception as e:
+        error_type = type(e).__name__
+        error_msg = str(e) if str(e) else f"Unknown error ({error_type})"
+        logger.error(f"Error creating repository: {error_msg}")
+        print(f"{colors['RED']}Error creating repository: {error_msg} ({error_type}){colors['RESET']}")
+        return None
+
+def setup_local_git_repo(repo_path, github_repo, username, github_token):
+    """
+    Initialize a local git repository and connect it to GitHub.
+    
+    Args:
+        repo_path (str): Path to local directory
+        github_repo (github.Repository.Repository): GitHub repository object
+        username (str): GitHub username
+        github_token (str): GitHub personal access token
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """ 
+    try:
+        # Change to the repository directory
+        os.chdir(repo_path)
+        
+        # Check if git is already initialized
+        git_dir = os.path.join(repo_path, ".git")
+        if not os.path.exists(git_dir):
+            print("Initializing git repository...")
+            result = run_command(["git", "init"])
+            if result is None:
+                print(f"{colors['RED']}Failed to initialize git repository.{colors['RESET']}")
+                return False
+        
+        # Configure remote
+        remote_url = f"https://{username}:{github_token}@github.com/{github_repo.full_name}.git"
+        remotes = run_command(["git", "remote"])
+        if remotes is None or "origin" not in remotes.split():
+            print("Adding remote origin...")
+            result = run_command(["git", "remote", "add", "origin", remote_url])
+        else:
+            print("Updating remote origin...")
+            result = run_command(["git", "remote", "set-url", "origin", remote_url])
+        if result is None:
+            print(f"{colors['RED']}Failed to configure remote.{colors['RESET']}")
+            return False
+        
+        # Check if there are any uncommitted changes
+        status = run_command(["git", "status", "--porcelain"])
+        if status:
+            # Ask to stage all changes
+            print("Uncommitted changes detected.")
+            stage_all = input("Do you want to stage all changes? (yes/no): ").strip().lower()
+            if stage_all == "yes":
+                run_command(["git", "add", "."])
+                # Commit changes
+                commit_msg = input("Enter commit message for initial commit: ").strip()
+                if not commit_msg:
+                    commit_msg = "Initial commit"
+                result = run_command(["git", "commit", "-m", commit_msg])
+                if result is None:
+                    print(f"{colors['YELLOW']}⚠️ Failed to commit changes. Please check your git configuration.{colors['RESET']}")
+                    print("You may need to configure git username and email:")
+                    print("  git config --global user.name \"Your Name\"")
+                    print("  git config --global user.email \"youremail@example.com\"")
+                    return False
+        
+        # Check if we have any commits
+        has_commits = run_command(["git", "rev-parse", "--verify", "HEAD"])
+        if has_commits is None:
+            # No commits yet, create an initial commit
+            print("No commits found. Creating initial commit...")
+            # Add all files first
+            run_command(["git", "add", "."])
+            # Then commit
+            run_command(["git", "commit", "-m", "Initial commit"])
+        
+        # Push to the repository with progress feedback
+        print("Pushing to GitHub repository...")
+        
+        # Try to push to master/main first
+        default_branch = github_repo.default_branch
+        result = run_command(["git", "push", "-u", "origin", default_branch])
+        if result is None:
+            # If default branch push fails, try to push to a temporary branch first
+            print(f"Could not push directly to {default_branch}. Trying alternative approach...")
+            # Get current branch or use main as default
+            current_branch = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+            if current_branch is None:
+                current_branch = "main"
+            # Push to current branch
+            result = run_command(["git", "push", "-u", "origin", current_branch])
+            
+            if result is None:
+                print(f"{colors['RED']}Failed to push to GitHub. Your repository is set up but needs manual pushing.{colors['RESET']}")
+                print(f"Repository URL: {github_repo.html_url}")
+                return False
+        
+        print(f"{colors['GREEN']}✓ Successfully pushed to GitHub!{colors['RESET']}")
+        print(f"Repository URL: {github_repo.html_url}")
+        return True
+    except Exception as e:
+        logger.error(f"Error setting up local git repository: {e}")
+        print(f"{colors['RED']}Error setting up local git repository: {e}{colors['RESET']}")
+        return False
+
+def check_and_get_repo(username, github_token, repo_name):
+    """
+    Check if a repository exists and clone/pull it if it does.
+    
+    Args:
+        username (str): GitHub username
+        github_token (str): GitHub personal access token
+        repo_name (str): Repository name
+        
+    Returns:
+        tuple: (repo_exists (bool), repo_object (github.Repository) or None)
+    """
+    try:
+        # Create GitHub instance
+        g = Github(github_token)
+        
+        # Remove any username prefix from the repository name
+        if "/" in repo_name:
+            repo_name = repo_name.split("/")[-1]
+            
+        full_repo_name = f"{username}/{repo_name}"
+        
+        # Check if repo exists
+        try:
+            existing_repo = g.get_repo(full_repo_name)
+            print(f"{colors['GREEN']}✓ Repository exists: {existing_repo.html_url}{colors['RESET']}")
+            return True, existing_repo
+        except github.GithubException as e:
+            # Repo doesn't exist
+            if e.status == 404:
+                return False, None
+            # Other API error
+            raise
+            
+    except Exception as e:
+        logger.error(f"Error checking repository: {e}")
+        print(f"{colors['RED']}Error checking repository: {e}{colors['RESET']}")
+        return False, None
+        
+def clone_or_pull_repo(repo, repo_path, username, github_token):
+    """
+    Clone or pull from an existing GitHub repository.
+    
+    Args:
+        repo (github.Repository): GitHub repository object
+        repo_path (str): Local path where repository should be cloned
+        username (str): GitHub username
+        github_token (str): GitHub personal access token
+        
+    Returns:
+        bool: Success status
+    """
+    try:
+        # Check if directory exists
+        if os.path.exists(repo_path):
+            print(f"Directory already exists at {repo_path}")
+            if os.path.exists(os.path.join(repo_path, ".git")):
+                # Directory is a git repository, do a pull
+                print("Local git repository found. Pulling latest changes...")
+                
+                # Save current directory to restore later
+                original_dir = os.getcwd()
+                
+                # Change to repo directory
+                os.chdir(repo_path)
+                
+                # Configure remote with credentials
+                remote_url = f"https://{username}:{github_token}@github.com/{repo.full_name}.git"
+                run_command(["git", "remote", "set-url", "origin", remote_url])
+                
+                # Pull changes
+                result = run_command(["git", "pull", "origin", repo.default_branch])
+                
+                # Restore original directory
+                os.chdir(original_dir)
+                
+                if result is None:
+                    print(f"{colors['RED']}Failed to pull latest changes.{colors['RESET']}")
+                    return False
+                    
+                print(f"{colors['GREEN']}✓ Successfully pulled latest changes.{colors['RESET']}")
+                return True
+            else:
+                print(f"{colors['YELLOW']}Directory exists but is not a git repository.{colors['RESET']}")
+                use_dir = input("Use this directory anyway? This will initialize git in it. (yes/no): ").strip().lower()
+                if use_dir != "yes":
+                    return False
+                    
+                # Initialize git in existing directory
+                os.chdir(repo_path)
+                run_command(["git", "init"])
+        else:
+            # Directory doesn't exist, clone the repository
+            print(f"Cloning repository to {repo_path}...")
+            remote_url = f"https://{username}:{github_token}@github.com/{repo.full_name}.git"
+            result = run_command(["git", "clone", remote_url, repo_path])
+            
+            if result is None:
+                print(f"{colors['RED']}Failed to clone repository.{colors['RESET']}")
+                return False
+                
+            print(f"{colors['GREEN']}✓ Repository cloned successfully.{colors['RESET']}")
+            
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in clone_or_pull_repo: {e}")
+        print(f"{colors['RED']}Error cloning/pulling repository: {e}{colors['RESET']}")
+        return False
+
+# Modify create_repo_workflow to use these functions
+def create_repo_workflow():
+    """Workflow for creating or cloning a GitHub repository."""
+    print(f"\n{colors['BOLD']}--- Create or Clone GitHub Repository ---{colors['RESET']}")
+    
+    # Display current directory
+    current_dir = os.getcwd()
+    print(f"\n{colors['BLUE']}Current working directory:{colors['RESET']}")
+    print(f"{colors['BOLD']}{current_dir}{colors['RESET']}")
+    print("\n")
+    
+    # Get local directory path
+    while True:
+        repo_path = input("Enter the path to your local directory: ").strip()
+        if os.path.exists(repo_path) and os.path.isdir(repo_path):
+            break
+        else:
+            print(f"{colors['RED']}Invalid directory path. Please try again.{colors['RESET']}")
+    
+    # Authenticate with GitHub
+    username = input("Enter your GitHub username: ").strip()
+    github_token = input("Enter your GitHub personal access token: ").strip()
+    
+    try:
+        # Create GitHub instance
+        g = Github(github_token)
+        user = g.get_user()
+        
+        # Verify authentication
+        try:
+            user_login = user.login
+            print(f"{colors['GREEN']}✓ Successfully authenticated as {user_login}{colors['RESET']}")
+        except github.GithubException:
+            print(f"{colors['RED']}Authentication failed. Please check your token.{colors['RESET']}")
+            return
+        
+        # Get repository details
+        repo_name = input("Enter repository name: ").strip()
+        if not repo_name:
+            print(f"{colors['RED']}Repository name cannot be empty.{colors['RESET']}")
+            return
+        
+        # Use a direct REST API call to check if repository exists
+        # This is more reliable than using PyGithub's get_repo which can fail with cryptic errors
+        full_repo_name = f"{username}/{repo_name}"
+        api_url = f"https://api.github.com/repos/{full_repo_name}"
+        
+        headers = {
+            "Authorization": f"token {github_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        import requests
+        response = requests.get(api_url, headers=headers)
+        repo_exists = response.status_code == 200
+        
+        if repo_exists:
+            # Repository exists, ask to clone/pull
+            print(f"{colors['YELLOW']}⚠️ Repository already exists at: https://github.com/{full_repo_name}{colors['RESET']}")
+            action = input("Repository already exists. Clone/pull it? (yes/no): ").strip().lower()
+            if action == "yes":
+                # Get the existing repo directly via REST API to avoid PyGithub errors
+                try:
+                    existing_repo = g.get_repo(full_repo_name)
+                    success = clone_or_pull_repo(existing_repo, repo_path, username, github_token)
+                    if success:
+                        print(f"{colors['GREEN']}✓ Repository setup complete.{colors['RESET']}")
+                except Exception as e:
+                    print(f"{colors['RED']}Error accessing repository: {e}{colors['RESET']}")
+                    print(f"Try cloning manually with: git clone https://github.com/{full_repo_name}.git {repo_path}")
+            else:
+                print("Operation cancelled.")
+                return
+        else:
+            # Create new repository
+            description = input("Enter repository description (optional): ").strip()
+            private = input("Make repository private? (yes/no): ").strip().lower() == "yes"
+            auto_init = input("Initialize with README.md? (yes/no): ").strip().lower() == "yes"
+            
+            # Try direct REST API call instead of PyGithub
+            create_url = f"https://api.github.com/user/repos"
+            repo_data = {
+                "name": repo_name,
+                "description": description,
+                "private": private,
+                "auto_init": auto_init
+            }
+            
+            response = requests.post(create_url, json=repo_data, headers=headers)
+            if response.status_code in (201, 200):  # Success codes
+                new_repo_data = response.json()
+                print(f"{colors['GREEN']}✓ Repository created successfully: {new_repo_data['html_url']}{colors['RESET']}")
+                
+                # Now get the repo object using PyGithub
+                try:
+                    repo = g.get_repo(full_repo_name)
+                    # Set up local git repository and push to GitHub
+                    success = setup_local_git_repo(repo_path, repo, username, github_token)
+                    
+                    if success:
+                        # Ask if user wants to protect the default branch
+                        protect_branch_opt = input(f"Do you want to protect the {repo.default_branch} branch? (yes/no): ").strip().lower()
+                        if protect_branch_opt == "yes":
+                            print(f"\nSetting up protection for {repo.default_branch} branch...")
+                            protect_branch(repo, repo.default_branch)
+                except Exception as e:
+                    print(f"{colors['YELLOW']}Repository created, but local setup failed: {e}{colors['RESET']}")
+                    print(f"You can clone it manually with: git clone {new_repo_data['html_url']}")
+            else:
+                error_msg = response.json().get('message', f"HTTP Error: {response.status_code}")
+                print(f"{colors['RED']}Error creating repository: {error_msg}{colors['RESET']}")
+                if "already exists" in str(error_msg).lower():
+                    print(f"A repository named '{repo_name}' already exists for your account.")
+    
+    except Exception as e:
+        logger.error(f"Error in create_repo_workflow: {e}")
+        print(f"{colors['RED']}Error: {e}{colors['RESET']}")
+
+def display_menu():
+    """Display the main menu."""
+    clear_screen()
+    print("\n" + "=" * 50)
+    print("GitHub Repository Management Tools".center(50))
+    print("=" * 50)
+    print("1. Apply Branch Protection")
+    print("2. Create Repository from Local Directory")
+    print("3. Delete a Branch")
+    print("4. Push Changes & Create Pull Request")
+    print("5. Quick Git Add, Commit & Push")
+    print("6. Remove Branch Protection")
+    print("7. Review & Merge Pull Requests")
+    print("8. Show User & Repository Info")
+    print("9. Exit")
+    print("-" * 50)
+    return input("Enter your choice (1-9): ").strip()
+
+def parse_cli_arguments():
+    """Parse command-line arguments for quick commands"""
+    parser = argparse.ArgumentParser(description="GitHub Repository Management Tool")
+    
+    # Quick commands
+    parser.add_argument("--merge", type=int, help="Merge PR by number")
+    parser.add_argument("--create", help="Create new repo from current directory")
+    parser.add_argument("--protect", help="Protect branch by name")
+    parser.add_argument("--stats", action="store_true", help="Show repository statistics")
+    
+    return parser.parse_args()
+
+# Fix the syntax warning by using a raw string for the ASCII art
+def display_credits():
+    """Display credits with ASCII art when exiting the program."""
+    # Clear the screen
+    clear_screen()
+    
+    # Get terminal size
+    terminal_width, _ = shutil.get_terminal_size((80, 20))
+    
+    # The ASCII art embedded directly in the script using a raw string to avoid escape issues
+    # Split into parts so we can color just the text portion
+    ascii_art_top = """
+                         ,▄▄▄▄▄▄▄▄;,,,▄▄▄███████▄
+                         ██████████████████▄▄▄   ▀██▄
+                        ████████████████████▀▀ ,▄▄████
+                       ▐██▀ ▀██████████████████████████
+                       ███▄          ,██████████████████
+                      ▐█████▄,▄██████████████████████████
+                      ╘██████████████████████████████████▌
+          ,▄▄████████   ▀█████████████████████████████████▄
+         ████████████      └▀▀▀████████████████████████████
+        ▐█████████████▄            `╙▀▀████████████████████  ▄▄;
+         ▀███████████████▄              ▐█████████████████-╓███████▄
+           ██████████████████▄▄,         ████████████████████████████▄
+             ▀█████████████████████▄▄▄;,  ▐███████████████████████████▌
+                ▀█████████████████████████████████████████████████████▌
+                   ▀▀█████████████████████████████████████████████████`
+                   ▄▄,-▀▀████████████████████████████████████████████`
+                 ▄█████▄    ▀▀████████████████████████████████████▀└
+                 ████████▄,▄▄    ╙▀▀███████████████████████████▀-
+             ,    ▀███████████▄         -└▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀"
+   ▄▄▄▄▄▄▄██████µ   ▀███████████▄,               ,      ,
+   ███████████████▄▄▄▄██████████████████████████████████▌
+    ████████████████████████████████████████████████████
+     ▀███████████████████████████████████   ▀▀▀ ███████▌                
+      ▀█████████████████████████████████████▄▄▄████████     ,▄▄▄▄▄█▄▄▄▄⌐    
+        █████████████████████████████████████████████▀     ▐██████████▀
+          █████████████████████████████████████████▀   ▄████████████▀
+           ╙██████████████████████████████████████▀  ▄████████████▀
+              ▀██████████████████████████████████▄▄█████████████▀
+                 ▀███████████████████████████████████████████▀
+                    ▀▀███████████████████████████████████▀╙
+                        ╙▀▀█████████████████████████▀▀-
+                              `-▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀¬
+                 """
+    
+    # The text part to be colored in dark red                 
+    ascii_art_text = r"""   __|  |                |      |                              |    _ _| \ \   / __|   __|  | 
+ \__ \    \    _` |   _` |   _` |   _ \   ` \    _` |    \     |      |   \ \ /  _|  \__ \ _| 
+ ____/ _| _| \__,_| \__,_| \__,_| \___/ _|_|_| \__,_| _| _|   ____| ___|   \_/  ___| ____/ _)"""
+    
+    # The final part
+    ascii_art_bottom = r"""                                                                                              
+"EE/DE Utilities"
+GitHub Repo=<github repo>
+gh-utils version:"""
+
+    # Replace version placeholder with actual version
+    ascii_art_bottom = ascii_art_bottom.replace("gh-utils version:", f"gh-utils version: {__version__}")
+    
+    # Print the ASCII art
+    print("\n")  # Add some padding at top
+    
+    # Print top part normally
+    print(ascii_art_top)
+    
+    # Print text part in dark red
+    for line in ascii_art_text.split('\n'):
+        print(f"{colors['RED']}{line}{colors['RESET']}")
+    
+    # Print bottom part normally
+    print(ascii_art_bottom)
+    
+    print(f"\n{colors['GREEN']}Thanks for using GitHub Repository Management Tools!{colors['RESET']}")
+    print(f"\n{colors['YELLOW']}Exiting in 4 seconds...{colors['RESET']}")
+    time.sleep(4)
+
+def main():
+    """Main program."""
+    try:
+        # Remove the credits display at startup (keeping it only when exiting)
+        args = parse_cli_arguments()
+        
+        # Handle command line arguments
+        if args.merge:
+            repo, repo_path, username, github_token, repo_name = setup_repo_authentication()
+            pr = repo.get_pull(args.merge)
+            review_pull_request(repo, pr)
+            merge_pull_request(repo, pr)
+            sys.exit(0)
+        elif args.create:
+            create_repo_workflow()
+            sys.exit(0)
+        elif args.protect and args.protect.strip():
+            repo, repo_path, username, github_token, repo_name = setup_repo_authentication()
+            protect_branch(repo, args.protect)
+            sys.exit(0)
+        elif args.stats:
+            repo, repo_path, username, github_token, repo_name = setup_repo_authentication()
+            show_repository_dashboard(repo)
+            sys.exit(0)
+            
+        # Main interactive menu loop
+        while True:
+            choice = display_menu()
+            
+            if choice == '1':
+                branch_protection_workflow()
+            elif choice == '2':
+                create_repo_workflow()
+            elif choice == '3':
+                delete_branch_workflow()
+            elif choice == '4':
+                push_and_pr_workflow()
+            elif choice == '5':
+                quick_git_commit_push()
+            elif choice == '6':
+                branch_protection_workflow()  # This handles both protect and unprotect
+            elif choice == '7':
+                review_merge_workflow()
+            elif choice == '8':
+                user_and_repo_info_workflow()
+            elif choice == '9':
+                display_credits()  # Show credits before exiting
+                sys.exit(0)
+            else:
+                print("\nInvalid choice. Please enter a number between 1 and 9.")
+                
+            input("\nPress Enter to return to the main menu...")
+            
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user. Exiting gracefully.")
+        sys.exit(0)
+    except ValueError:
+        print("\nInvalid input. Please enter a valid number when prompted.")
+        sys.exit(1)
+
+# --- ENHANCED USER INTERFACE FUNCTIONS ---
+
+def install_tui_dependencies():
+    """Install dependencies for terminal UI if needed"""
+    try:
+        import rich
+        import questionary
+        return True
+    except ImportError:
+        print("Installing TUI dependencies...")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "--ignore-installed", "--user", "--no-cache", '--root-user-action=ignore', "rich", "questionary"], check=True)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to install UI dependencies: {e}")
+            print(f"Could not install UI dependencies: {e}")
+            print("You can manually install them with: pip install --user rich questionary")
+            return False
+
+def enhanced_menu_display():
+    """Display an interactive menu selection using questionary."""
+    try:
+        import questionary
+        from rich.console import Console
+        from rich.panel import Panel
+        console = Console()
+        console.print(Panel.fit("GitHub Repository Management Tools", 
+                              border_style="green", 
+                              title=f"[bold blue]gh-utils v{__version__}[/bold blue]"))
+        choice = questionary.select(
+            "Select an action:",
+            choices=[
+                {"name": "Apply Branch Protection", "value": "1"},
+                {"name": "Create Repository from Local Directory", "value": "2"},
+                {"name": "Delete a Branch", "value": "3"},
+                {"name": "Push Changes & Create Pull Request", "value": "4"},
+                {"name": "Quick Git Add, Commit & Push", "value": "5"},
+                {"name": "Remove Branch Protection", "value": "6"},
+                {"name": "Review & Merge Pull Requests", "value": "7"},
+                {"name": "Show User & Repository Info", "value": "8"},
+                {"name": "Exit", "value": "9"}
+            ],
+            qmark="❯"
+        ).ask()
+        return choice or "9"  # Default to exit
+    except ImportError:
+        # Use the standard display_menu function
+        return display_menu()
+
+def show_repository_dashboard(repo):
+    """Show repository overview dashboard with rich visualization"""
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich import box
+        console = Console()
+            
+        # Header
+        console.print(Panel.fit(
+            f"[bold]Repository: {repo.full_name}[/bold]",
+            border_style="green"
+        ))
+        
+        console.print(f"Description: {repo.description or 'No description'}")
+        console.print(f"Visibility: {'[red]Private[/red]' if repo.private else '[green]Public[/green]'}")
+        
+        # Stats table
+        stats_table = Table(title="Repository Statistics", box=box.ROUNDED)
+        stats_table.add_column("Metric", style="cyan")
+        stats_table.add_column("Value", style="green", justify="right")
+        stats_table.add_row("Stars", str(repo.stargazers_count))
+        stats_table.add_row("Forks", str(repo.forks_count))
+        stats_table.add_row("Watchers", str(repo.subscribers_count))
+        stats_table.add_row("Open Issues", str(repo.open_issues_count))
+        stats_table.add_row("Default Branch", repo.default_branch)
+        stats_table.add_row("Created", repo.created_at.strftime("%Y-%m-%d"))
+        stats_table.add_row("Last Updated", repo.updated_at.strftime("%Y-%m-%d %H:%M"))
+        console.print(stats_table)
+        
+        # Branch comparison
+        console.print("\n[bold]Branch Status[/bold]")
+        def get_branches_with_commits():
+            branches = []
+            for branch in repo.get_branches():
+                try:
+                    ahead_behind = repo.compare(f"{repo.default_branch}...{branch.name}")
+                    branches.append((
+                        branch.name, 
+                        ahead_by, 
+                        behind_by,
+                        branch.name in PROTECTED_BRANCHES
+                    ))
+                except Exception:
+                    branches.append((branch.name, "?", "?", branch.name in PROTECTED_BRANCHES))
+            return branches
+        branches = get_branches_with_commits()
+        
+        branch_table = Table(box=box.SIMPLE)
+        branch_table.add_column("Branch", style="cyan")
+        branch_table.add_column("Ahead", justify="right")
+        branch_table.add_column("Behind", justify="right")
+        branch_table.add_column("Protected", justify="center")
+        for branch, ahead, behind, protected in branches:
+            is_default = branch == repo.default_branch
+            branch_style = "bold" if is_default else ""
+            protected_status = "✓" if protected else ""
+            branch_table.add_row(
+                f"[{branch_style}]{branch}[/{branch_style}]" if branch_style else branch,
+                str(ahead),
+                str(behind),
+                protected_status
+            )
+        console.print(branch_table)
+        
+        # Recent activity
+        console.print("\n[bold]Recent Activity[/bold]")
+        activity_table = Table(box=box.SIMPLE)
+        activity_table.add_column("Event", style="cyan")
+        activity_table.add_column("User", style="green")
+        activity_table.add_column("Date", style="yellow")
+        try:
+            events = list(repo.get_events())[:5]
+            for event in events:
+                activity_table.add_row(
+                    event.type,
+                    event.actor.login if event.actor else "Unknown",
+                    event.created_at.strftime("%Y-%m-%d %H:%M")
+                )
+            console.print(activity_table)
+        except Exception as e:
+            console.print(f"[yellow]Could not fetch recent events: {e}[/yellow]")
+        
+        # Pull Request summary
+        try:
+            open_prs = list(repo.get_pulls(state='open'))
+            if open_prs:
+                console.print(f"\n[bold]Open Pull Requests ({len(open_prs)})[/bold]")
+                for pr in open_prs[:3]:  # Show most recent 3
+                    console.print(f"#{pr.number}: {pr.title}")
+                if len(open_prs) > 3:
+                    console.print(f"... and {len(open_prs) - 3} more")
+        except Exception as e:
+            console.print(f"[yellow]Could not fetch pull requests: {e}[/yellow]")
+        
+        return True
+    except ImportError:
+        # Fallback to simple text display
+        print(f"\nRepository Dashboard: {repo.full_name}")
+        print("-" * 50)
+        print(f"Description: {repo.description or 'No description'}")
+        print(f"Visibility: {'Private' if repo.private else 'Public'}")
+        print(f"Stars: {repo.stargazers_count} | Forks: {repo.forks_count} | Watchers: {repo.subscribers_count}")
+        print(f"Open Issues: {repo.open_issues_count}")
+        print(f"Default Branch: {repo.default_branch}")
+        print(f"Created: {repo.created_at.strftime('%Y-%m-%d')}")
+        print(f"Last Updated: {repo.updated_at.strftime('%Y-%m-%d %H:%M')}")
+        print("-" * 50)
+        
+        # Show branches in simple format
+        print("\nBranch Structure:")
+        try:
+            branches = get_cached_branches(repo)
+            default_branch = repo.default_branch
+            
+            print(f"* {default_branch} (default)")
+            
+            for branch in branches:
+                if branch.name != default_branch:
+                    protected = f" {colors['YELLOW']}(protected){colors['RESET']}" if branch.name in PROTECTED_BRANCHES else ""
+                    print(f"  ├─ {branch.name}{protected}")
+                    
+                    # Try to check for PRs
+                    try:
+                        pulls = list(repo.get_pulls(head=f"{repo.owner.login}:{branch.name}", 
+                                               base=default_branch, 
+                                               state="open"))
+                        if pulls:
+                            pr = pulls[0]
+                            status = f"{colors['GREEN']}[Ready]{colors['RESET']}" if pr.mergeable else f"{colors['RED']}[Conflicts]{colors['RESET']}"
+                            print(f"     └─ PR #{pr.number}: {pr.title} {status}")
+                    except:
+                        pass
+            
+            return True
+        except Exception as e:
+            print(f"Could not fetch branches: {e}")
+            
+        return True
+
+def setup_notification_system():
+    """Set up desktop notifications for long-running tasks"""
+    try:
+        # Try different notification systems based on platform
+        if sys.platform == "linux":
+            try:
+                import notify2
+                notify2.init("GitHub Utils")
+                return "notify2"
+            except ImportError:
+                pass
+        elif sys.platform == "darwin":  # macOS
+            try:
+                import pync
+                notification_system = "pync"
+            except ImportError:
+                pass
+        elif sys.platform == "win32":
+            try:
+                from win10toast import ToastNotifier
+                notification_system = "win10toast"
+            except ImportError:
+                pass
+                
+        return None
+    except Exception:
+        logger.debug("Notification system setup failed")
+        return None
+
+def send_notification(title, message):
+    """Send a desktop notification if supported"""
+    if not hasattr(send_notification, 'system'):
+        send_notification.system = setup_notification_system()
+    
+    if send_notification.system == "notify2":
+        try:
+            import notify2
+            notification = notify2.Notification(title, message)
+            notification.show()
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to send notify2 notification: {e}")
+    elif send_notification.system == "pync":
+        try:
+            import pync
+            pync.notify(message, title=title)
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to send pync notification: {e}")
+    elif send_notification.system == "win10toast":
+        try:
+            from win10toast import ToastNotifier
+            toaster = ToastNotifier()
+            toaster.show_toast(title, message, duration=5, threaded=True)
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to send win10toast notification: {e}")
+    return False
+
+def save_command_history(command):
+    """Save a command to history file"""
+    try:
+        history_path = os.path.expanduser("~/.gh-utils-history")
+        with open(history_path, "a") as f:
+            f.write(f"{time.time()},{command}\n")
+    except Exception as e:
+        logger.debug(f"Could not save command history: {e}")
+
+def get_command_history(limit=10):
+    """Get recent command history"""
+    try:
+        history_path = os.path.expanduser("~/.gh-utils-history")
+        if os.path.exists(history_path):
+            with open(history_path, "r") as f:
+                lines = f.readlines()[-limit:]
+                return [line.strip().split(",", 1)[1] for line in lines]
+    except Exception as e:
+        logger.debug(f"Could not get command history: {e}")
+    return []
+
+# Example of using questionary for branch selection (should be inside a function)
+def select_branch(branch_names):
+    """Select a branch using questionary."""
+    try:
+        import questionary
+        return questionary.select(
+            "Select a branch:",
+            choices=[f"{i+1}. {branch}" for i, branch in enumerate(branch_names)]
+        ).ask()
+    except ImportError:
+        # Fallback to standard input
+        print("\nAvailable branches:")
+        for i, branch in enumerate(branch_names, start=1):
+            print(f"{i}. {branch}")
+        
+        choice = input("\nSelect branch number: ").strip()
+        try:
+            index = int(choice) - 1
+            if 0 <= index < len(branch_names):
+                return branch_names[index]
+        except ValueError:
+            pass
+        
+        return None
+
+def quick_git_commit_push():
+    """Quickly perform git add --all, commit, and push."""
+    print(f"\n{colors['BOLD']}--- Quick Git Commit & Push ---{colors['RESET']}")
+    
+    # Check if current directory is a git repository
+    if not os.path.exists(os.path.join(os.getcwd(), ".git")):
+        print(f"{colors['RED']}Current directory is not a git repository.{colors['RESET']}")
+        return False
+        
+    # Check for uncommitted changes
+    print("Checking for changes...")
+    status = run_command(["git", "status", "--porcelain"])
+    
+    if not status:
+        print(f"{colors['YELLOW']}No changes detected.{colors['RESET']}")
+        return False
+    
+    # Show changes
+    print(f"Changes to commit:")
+    for line in status.split("\n"):
+        if line.strip():
+            print(f"  {line}")
+    
+    # Run git add --all
+    print("Adding all files...")
+    result = run_command(["git", "add", "--all"])
+    if result is None:
+        print(f"{colors['RED']}Failed to add files.{colors['RESET']}")
+        return False
+    
+    # Get commit message
+    commit_msg = input("\nEnter commit message: ").strip()
+    if not commit_msg:
+        print(f"{colors['YELLOW']}Commit message cannot be empty.{colors['RESET']}")
+        return False
+    
+    # Commit changes
+    print("Committing changes...")
+    result = run_command(["git", "commit", "-m", commit_msg])
+    if result is None:
+        print(f"{colors['RED']}Failed to commit changes.{colors['RESET']}")
+        return False
+    
+    # Push changes
+    print("Pushing changes...")
+    current_branch = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    if current_branch:
+        result = run_command(["git", "push", "origin", current_branch])
+        if result is None:
+            # Try setting upstream
+            print(f"{colors['YELLOW']}Simple push failed. Trying to set upstream...{colors['RESET']}")
+            result = run_command(["git", "push", "-u", "origin", current_branch])
+            if result is None:
+                print(f"{colors['RED']}Failed to push changes.{colors['RESET']}")
+                return False
+    else:
+        print(f"{colors['RED']}Failed to determine current branch.{colors['RESET']}")
+        return False
+    
+    print(f"{colors['GREEN']}✓ Changes committed and pushed successfully.{colors['RESET']}")
+    return True
+
+def show_user_and_repo_info(repo, username, github_token=None):
+    """Display information about the current GitHub user and repository."""
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich import box
+        
+        console = Console()
+        
+        # Get user information - create a new Github instance
+        g = Github(github_token)
+        user = g.get_user(username)
+        
+        # User info panel
+        console.print(Panel.fit(
+            f"[bold]GitHub User: {user.login}[/bold]",
+            border_style="blue"
+        ))
+        
+        # User stats table
+        user_table = Table(title="User Information", box=box.ROUNDED)
+        user_table.add_column("Property", style="cyan")
+        user_table.add_column("Value", style="green")
+        
+        user_table.add_row("Name", user.name or "Not set")
+        user_table.add_row("Email", user.email or "Not set")
+        user_table.add_row("Company", user.company or "Not set")
+        user_table.add_row("Location", user.location or "Not set")
+        user_table.add_row("Public Repos", str(user.public_repos))
+        user_table.add_row("Followers", str(user.followers))
+        user_table.add_row("Following", str(user.following))
+        user_table.add_row("Created", user.created_at.strftime("%Y-%m-%d") if user.created_at else "Unknown")
+        
+        console.print(user_table)
+        
+        # Repository info panel
+        console.print("\n")
+        console.print(Panel.fit(
+            f"[bold]Current Repository: {repo.full_name}[/bold]",
+            border_style="green"
+        ))
+        
+        # Repository stats table
+        repo_table = Table(title="Repository Information", box=box.ROUNDED)
+        repo_table.add_column("Property", style="cyan")
+        repo_table.add_column("Value", style="green")
+        
+        repo_table.add_row("Description", repo.description or "No description")
+        repo_table.add_row("Visibility", "Private" if repo.private else "Public")
+        repo_table.add_row("Default Branch", repo.default_branch)
+        repo_table.add_row("Stars", str(repo.stargazers_count))
+        repo_table.add_row("Forks", str(repo.forks_count))
+        repo_table.add_row("Watchers", str(repo.subscribers_count))
+        repo_table.add_row("Open Issues", str(repo.open_issues_count))
+        repo_table.add_row("Created", repo.created_at.strftime("%Y-%m-%d"))
+        repo_table.add_row("Last Updated", repo.updated_at.strftime("%Y-%m-%d %H:%M"))
+        repo_table.add_row("License", repo.license.name if repo.license else "No license")
+        repo_table.add_row("Language", repo.language or "Not specified")
+        
+        console.print(repo_table)
+        
+        # Show collaborators if possible
+        try:
+            collaborators = list(repo.get_collaborators())
+            if collaborators:
+                console.print("\n[bold]Repository Collaborators[/bold]")
+                collab_table = Table(box=box.SIMPLE)
+                collab_table.add_column("Username")
+                collab_table.add_column("Permissions")
+                
+                for collaborator in collaborators:
+                    permissions = "Admin" if collaborator.permissions.admin else "Write" if collaborator.permissions.push else "Read"
+                    collab_table.add_row(collaborator.login, permissions)
+                
+                console.print(collab_table)
+        except Exception as e:
+            console.print(f"[yellow]Could not retrieve collaborators: {e}[/yellow]")
+            
+        return True
+        
+    except ImportError:
+        # Fallback to simple text display
+        print(f"\n{colors['BOLD']}GitHub User: {username}{colors['RESET']}")
+        print("-" * 50)
+        
+        try:
+            # Get user information
+            g = Github(github_token)
+            user = g.get_user(username)
+            
+            print(f"Name: {user.name or 'Not set'}")
+            print(f"Email: {user.email or 'Not set'}")
+            print(f"Company: {user.company or 'Not set'}")
+            print(f"Location: {user.location or 'Not set'}")
+            print(f"Public Repos: {user.public_repos}")
+            print(f"Followers: {user.followers}")
+            print(f"Following: {user.following}")
+            
+            print("\n")
+            print(f"{colors['BOLD']}Current Repository: {repo.full_name}{colors['RESET']}")
+            print("-" * 50)
+            
+            print(f"Description: {repo.description or 'No description'}")
+            print(f"Visibility: {'Private' if repo.private else 'Public'}")
+            print(f"Default Branch: {repo.default_branch}")
+            print(f"Stars: {repo.stargazers_count}")
+            print(f"Forks: {repo.forks_count}")
+            print(f"Watchers: {repo.subscribers_count}")
+            print(f"Open Issues: {repo.open_issues_count}")
+            print(f"Created: {repo.created_at.strftime('%Y-%m-%d')}")
+            print(f"Last Updated: {repo.updated_at.strftime('%Y-%m-%d %H:%M')}")
+        except Exception as e:
+            print(f"{colors['RED']}Error getting user information: {e}{colors['RESET']}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error displaying user and repo info: {e}")
+        print(f"{colors['RED']}Error displaying user and repository information: {e}{colors['RESET']}")
+        return False
+
+def user_and_repo_info_workflow():
+    """Workflow for displaying user and repository information."""
+    print(f"\n{colors['BOLD']}--- User & Repository Information ---{colors['RESET']}")
+    
+    # Setup authentication
+    repo, repo_path, username, github_token, repo_name = setup_repo_authentication()
+    
+    # Display user and repository information
+    show_user_and_repo_info(repo, username, github_token)
+    
+    input("\nPress Enter to return to the main menu...")
+
+if __name__ == "__main__":
+    main()
